@@ -25,9 +25,17 @@
       "popupX": 680,
       "popupY": 34,
       "autoHideOnBlur": true,
-      "flashOnAlert": true
+      "flashOnAlert": true,
+      "showCharacterName": true
     },
     "schema": [
+      {
+        "key": "showCharacterName",
+        "type": "boolean",
+        "label": "Show Character Name on Bar",
+        "defaultValue": true,
+        "description": "Display character name next to the crossed swords icon on the bar, or icon only."
+      },
       {
         "key": "popupWidth",
         "type": "integer",

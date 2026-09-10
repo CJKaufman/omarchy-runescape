@@ -90,7 +90,9 @@ def safe_read_state():
             "alert": False,
             "alertMessage": "",
             "address": "",
+            "showCharacterName": True,
             "lastDismissTime": 0,
+            "lastNotifId": 0,
             "lastUpdated": int(time.time() * 1000)
         }
     try:
@@ -347,27 +349,51 @@ def action_clear_alert():
     safe_write_state(state)
     return {"ok": True}
 
-def check_notifications():
-    if not NOTIF_DIR.exists():
-        return None
-    try:
-        now = time.time()
-        for f in NOTIF_DIR.glob("*.json"):
-            if f.is_file() and (now - f.stat().st_mtime) < 15:
-                try:
-                    with open(f, "r", encoding="utf-8") as nf:
-                        data = json.load(nf)
-                    app = str(data.get("app", "")).lower()
-                    summary = str(data.get("summary", "")).lower()
-                    body = str(data.get("body", "")).lower()
-                    text = f"{app} {summary} {body}"
-                    if "runelite" in app or "mining" in text or "idle" in text or "woodcutting" in text or "afk" in text:
-                        return data.get("summary") or data.get("body") or "Idle Notification"
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return None
+def action_set_config(data):
+    state = safe_read_state()
+    if "showCharacterName" in data:
+        state["showCharacterName"] = bool(data["showCharacterName"])
+    safe_write_state(state)
+    return {"ok": True, "showCharacterName": state.get("showCharacterName", True)}
+
+def check_notifications(state):
+    notif_dirs = [NOTIF_DIR / "history", NOTIF_DIR]
+    last_id = int(state.get("lastNotifId", 0))
+    highest_id = last_id
+    alert_msg = None
+
+    for d in notif_dirs:
+        if not d.exists():
+            continue
+        for f in d.glob("*.json"):
+            try:
+                fname = f.name
+                if "-" in fname and fname.endswith(".json"):
+                    id_part = fname.rsplit("-", 1)[1][:-5]
+                    if id_part.isdigit() and int(id_part) <= last_id:
+                        continue
+
+                with open(f, "r", encoding="utf-8") as nf:
+                    data = json.load(nf)
+                nid = int(data.get("id", 0))
+                if nid <= last_id:
+                    continue
+
+                app = str(data.get("app", "")).lower()
+                summary = str(data.get("summary", "")).lower()
+                body = str(data.get("body", "")).lower()
+                text = f"{app} {summary} {body}"
+
+                if "runelite" in app or "runescape" in app or "mining" in text or "idle" in text or "woodcutting" in text or "fishing" in text or "combat" in text or "afk" in text:
+                    if nid > highest_id:
+                        highest_id = nid
+                        alert_msg = data.get("body") or data.get("summary") or "AFK / Idle Alert"
+            except Exception:
+                continue
+
+    if alert_msg:
+        return True, alert_msg, highest_id
+    return False, "", highest_id
 
 def run_daemon():
     # Enforce singleton
@@ -391,6 +417,21 @@ def run_daemon():
     last_poll = 0
     buffer = ""
 
+    # Initialize notification baseline so we don't alert on old history
+    init_state = safe_read_state()
+    if init_state.get("lastNotifId", 0) == 0:
+        max_id = 0
+        for d in [NOTIF_DIR / "history", NOTIF_DIR]:
+            if d.exists():
+                for f in d.glob("*.json"):
+                    fname = f.name
+                    if "-" in fname and fname.endswith(".json"):
+                        p = fname.rsplit("-", 1)[1][:-5]
+                        if p.isdigit():
+                            max_id = max(max_id, int(p))
+        init_state["lastNotifId"] = max_id
+        safe_write_state(init_state)
+
     print(f"RuneScape Daemon started (PID {os.getpid()})")
 
     try:
@@ -408,14 +449,23 @@ def run_daemon():
                 except Exception:
                     sock = None
 
-            # Periodic state sync & notification directory check
-            if now - last_poll > 3:
+            # Periodic state sync & notification check (every 1 second)
+            if now - last_poll > 1.0:
                 last_poll = now
-                notif_alert = check_notifications()
                 state = safe_read_state()
+                has_alert, notif_msg, highest_id = check_notifications(state)
                 client = get_runelite_client()
 
                 modified = False
+                if highest_id > state.get("lastNotifId", 0):
+                    state["lastNotifId"] = highest_id
+                    modified = True
+
+                if has_alert and not state.get("alert"):
+                    state["alert"] = True
+                    state["alertMessage"] = notif_msg
+                    modified = True
+
                 if client:
                     ensure_jagex_launcher_hidden()
                     if not state.get("running"):
@@ -433,11 +483,6 @@ def run_daemon():
                         state["running"] = False
                         state["popupOpen"] = False
                         modified = True
-
-                if notif_alert and not state.get("alert"):
-                    state["alert"] = True
-                    state["alertMessage"] = notif_alert
-                    modified = True
 
                 if modified:
                     safe_write_state(state)
@@ -463,12 +508,19 @@ def run_daemon():
                         if not line:
                             continue
 
-                        # Handle activewindow: auto-hide popup when clicking outside
+                        # Handle activewindow: auto-hide popup when clicking outside, or clear alert if RuneLite focused
                         if line.startswith("activewindow>>"):
                             payload = line[len("activewindow>>"):]
                             parts = payload.split(",", 1)
                             active_cls = parts[0].strip().lower()
                             state = safe_read_state()
+
+                            # User focused or clicked inside RuneLite: clear alert!
+                            if ("runelite" in active_cls or active_cls == "net-runelite-launcher-launcher") and state.get("alert"):
+                                state["alert"] = False
+                                state["alertMessage"] = ""
+                                safe_write_state(state)
+
                             if state.get("popupOpen") and ("runelite" not in active_cls and active_cls != "net-runelite-launcher-launcher"):
                                 # Focus lost: dismiss popup
                                 active_sw = get_active_special_workspace()
@@ -504,13 +556,15 @@ def run_daemon():
 
                         # Handle urgency hint: flash icon
                         elif line.startswith("urgent>>"):
-                            addr = line[len("urgent>>"):].strip()
+                            addr = line[len("urgent>>"):].strip().lower().replace("0x", "")
                             state = safe_read_state()
                             client = get_runelite_client()
-                            if client and client.get("address") == addr:
-                                state["alert"] = True
-                                state["alertMessage"] = "Idle / Attention Required"
-                                safe_write_state(state)
+                            if client:
+                                c_addr = (client.get("address") or "").lower().replace("0x", "")
+                                if c_addr == addr:
+                                    state["alert"] = True
+                                    state["alertMessage"] = "AFK / Idle Alert"
+                                    safe_write_state(state)
 
                         # Handle client close
                         elif line.startswith("closewindow>>"):
@@ -582,6 +636,8 @@ def main():
         res = action_quit()
     elif action == "clear_alert":
         res = action_clear_alert()
+    elif action == "set_config":
+        res = action_set_config(req)
     else:
         res = {"ok": False, "error": f"Unknown action: {action}"}
 

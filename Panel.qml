@@ -52,6 +52,7 @@ Panel {
   property bool alert: false
   property string alertMessage: ""
   property bool flashPhase: false
+  property bool showCharacterName: Boolean(setting("showCharacterName", true))
 
   // Reactive State File Watcher
   FileView {
@@ -75,6 +76,9 @@ Panel {
       root.mode = String(s.mode || "popup")
       root.alert = s.alert === true
       root.alertMessage = String(s.alertMessage || "")
+      if (s.showCharacterName !== undefined) {
+        root.showCharacterName = s.showCharacterName === true
+      }
     } catch (e) {
       console.warn("runescape state parse error", e)
     }
@@ -83,7 +87,7 @@ Panel {
   // Flashing animation on alert
   Timer {
     id: flashTimer
-    interval: 450
+    interval: 400
     repeat: true
     running: root.alert && root.flashOnAlert
     onTriggered: root.flashPhase = !root.flashPhase
@@ -181,15 +185,23 @@ Panel {
     id: barButton
     anchors.fill: parent
     bar: root.bar
-    dimmed: false
-    active: (root.alert && root.flashPhase) || root.popupOpen
+    dimmed: root.alert ? !root.flashPhase : false
+    active: root.alert ? root.flashPhase : root.popupOpen
     activeColor: root.alert ? root.urgent : root.accent
     useActiveColor: true
     labelVisible: true
     fontSize: Style.font.body
     text: {
-      if (root.alert) return root.glyphCrossSwords + " AFK!"
-      if (root.running && root.character) return root.glyphCrossSwords + " " + root.character
+      var showName = root.showCharacterName
+      if (root.alert) {
+        if (showName && root.character) {
+          return root.glyphCrossSwords + " " + root.character + " (AFK!)"
+        }
+        return root.glyphCrossSwords
+      }
+      if (showName && root.running && root.character) {
+        return root.glyphCrossSwords + " " + root.character
+      }
       return root.glyphCrossSwords
     }
 
@@ -211,10 +223,17 @@ Panel {
         if (!root.running) {
           root.toggle()
         } else {
-          if (root.popupOpen) {
-            root.dismissPopup()
+          if (root.alert) {
+            root.clearAlert()
+            if (!root.popupOpen) {
+              root.togglePopup()
+            }
           } else {
-            root.togglePopup()
+            if (root.popupOpen) {
+              root.dismissPopup()
+            } else {
+              root.togglePopup()
+            }
           }
         }
       }
@@ -348,6 +367,84 @@ Panel {
               Button {
                 text: "Clear"
                 onClicked: root.clearAlert()
+              }
+            }
+          }
+
+          // Bar Appearance Settings
+          Rectangle {
+            width: parent.width
+            height: Style.space(48)
+            radius: 8
+            color: root.cardBg
+            border.color: root.borderCol
+            border.width: 1
+
+            RowLayout {
+              anchors.fill: parent
+              anchors.leftMargin: Style.space(12)
+              anchors.rightMargin: Style.space(12)
+              spacing: Style.space(10)
+
+              Text {
+                text: root.glyphCrossSwords
+                textFormat: Text.PlainText
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                color: root.accent
+              }
+
+              ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 1
+
+                Text {
+                  text: "Bar Display"
+                  textFormat: Text.PlainText
+                  font.bold: true
+                  color: root.foreground
+                  font.pixelSize: Style.font.caption
+                }
+
+                Text {
+                  text: root.showCharacterName
+                    ? ("Name & Icon (" + (root.character || "DarkOmenZA") + ")")
+                    : "Icon Only"
+                  textFormat: Text.PlainText
+                  color: root.dim
+                  font.pixelSize: Style.font.caption - 1
+                }
+              }
+
+              // Interactive Toggle Pill
+              Rectangle {
+                Layout.preferredWidth: Style.space(92)
+                Layout.preferredHeight: Style.space(26)
+                radius: 13
+                color: root.showCharacterName ? root.accent : root.subtleBg
+                border.color: root.showCharacterName ? root.accent : root.borderCol
+                border.width: 1
+
+                MouseArea {
+                  id: modeToggleMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    root.showCharacterName = !root.showCharacterName
+                    root.sendAction("set_config", { showCharacterName: root.showCharacterName })
+                  }
+                }
+
+                Text {
+                  anchors.centerIn: parent
+                  text: root.showCharacterName ? "Name & Icon" : "Icon Only"
+                  textFormat: Text.PlainText
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption - 1
+                  font.bold: true
+                  color: root.showCharacterName ? Color.background : root.foreground
+                }
               }
             }
           }
