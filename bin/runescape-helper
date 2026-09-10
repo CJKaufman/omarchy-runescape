@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+"""
+RuneScape Quick-Screen & Notification Manager Helper
+Manages RuneLite Hyprland scratchpad overlay, Jagex Launcher processes,
+focus-loss auto-dismiss, and idle/AFK notification flasher.
+"""
+
+import os
+import sys
+import json
+import time
+import socket
+import select
+import shutil
+import subprocess
+from pathlib import Path
+
+MAX_STDIN_BYTES = 65536
+STATE_DIR = Path.home() / ".local/state/omarchy/cjkaufman.runescape"
+STATE_FILE = STATE_DIR / "state.json"
+PID_FILE = Path(f"/run/user/{os.getuid()}/runescape-helper.pid")
+NOTIF_DIR = Path.home() / ".local/state/omarchy/notifications"
+
+def find_jagex_launcher():
+    candidates = [
+        shutil.which("jagex-launcher"),
+        Path.home() / "Downloads/Game Downloads/jagex-launcher-beta-linux-x86_64.AppImage",
+        Path.home() / "Downloads/jagex-launcher-beta-linux-x86_64.AppImage",
+        Path.home() / ".local/bin/jagex-launcher",
+        Path.home() / ".local/share/Jagex Launcher/jagex-launcher",
+    ]
+    for c in candidates:
+        if c and Path(c).exists():
+            return str(c)
+    downloads = Path.home() / "Downloads"
+    if downloads.exists():
+        for f in downloads.rglob("*jagex*launcher*.AppImage"):
+            if f.is_file():
+                return str(f)
+    return None
+
+def find_runelite():
+    candidates = [
+        shutil.which("runelite"),
+        shutil.which("RuneLite"),
+        Path.home() / ".local/share/Jagex Launcher/games/runelite/RuneLite.AppImage",
+        Path.home() / ".local/share/runelite/RuneLite.AppImage",
+        Path.home() / ".local/bin/RuneLite.AppImage",
+        Path("/var/lib/flatpak/exports/bin/net.runelite.RuneLite"),
+        Path.home() / ".local/share/flatpak/exports/bin/net.runelite.RuneLite",
+    ]
+    for c in candidates:
+        if c and Path(c).exists():
+            return str(c)
+    return None
+
+POPUP_W = 840
+POPUP_H = 600
+POPUP_X = 680
+POPUP_Y = 34
+
+def ensure_state_dir():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+
+def safe_write_state(state):
+    ensure_state_dir()
+    payload = json.dumps(state, indent=2).encode("utf-8")
+    tmp_file = STATE_DIR / f".state.tmp.{os.getpid()}"
+    try:
+        fd = os.open(str(tmp_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp_file), str(STATE_FILE))
+    except Exception as e:
+        if tmp_file.exists():
+            tmp_file.unlink(missing_ok=True)
+        print(f"Failed to write state: {e}", file=sys.stderr)
+
+def safe_read_state():
+    if not STATE_FILE.exists():
+        return {
+            "running": False,
+            "launcherRunning": False,
+            "character": "",
+            "popupOpen": False,
+            "mode": "popup",
+            "alert": False,
+            "alertMessage": "",
+            "address": "",
+            "lastDismissTime": 0,
+            "lastUpdated": int(time.time() * 1000)
+        }
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def run_hyprctl(args):
+    try:
+        res = subprocess.run(["hyprctl"] + args, capture_output=True, text=True, timeout=3)
+        return res.stdout.strip()
+    except Exception as e:
+        print(f"hyprctl error: {e}", file=sys.stderr)
+        return ""
+
+def run_hypr_eval(lua_code):
+    try:
+        res = subprocess.run(["hyprctl", "eval", lua_code], capture_output=True, text=True, timeout=3)
+        return res.stdout.strip()
+    except Exception as e:
+        print(f"hyprctl eval error: {e}", file=sys.stderr)
+        return ""
+
+def run_hypr_dispatch(lua_dsp):
+    try:
+        res = subprocess.run(["hyprctl", "dispatch", lua_dsp], capture_output=True, text=True, timeout=3)
+        return res.stdout.strip()
+    except Exception as e:
+        print(f"hyprctl dispatch error: {e}", file=sys.stderr)
+        return ""
+
+def get_runelite_client():
+    out = run_hyprctl(["clients", "-j"])
+    if not out:
+        return None
+    try:
+        clients = json.loads(out)
+        for c in clients:
+            cls = c.get("class", "").lower()
+            if "runelite" in cls or cls == "net-runelite-launcher-launcher":
+                return c
+    except Exception:
+        pass
+    return None
+
+def is_jagex_launcher_running():
+    try:
+        res = subprocess.run(["pgrep", "-f", "jagex-launcher"], capture_output=True, text=True)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+def get_active_special_workspace():
+    try:
+        out = run_hyprctl(["monitors", "-j"])
+        if not out:
+            return ""
+        mons = json.loads(out)
+        for m in mons:
+            if m.get("focused"):
+                return m.get("specialWorkspace", {}).get("name", "")
+        if mons:
+            return mons[0].get("specialWorkspace", {}).get("name", "")
+    except Exception:
+        pass
+    return ""
+
+def ensure_jagex_launcher_hidden():
+    """
+    If RuneLite is running, ensure jagex-launcher scratchpad
+    is closed/tucked away in 'special:runescape_launcher'.
+    """
+    active_sw = get_active_special_workspace()
+    if "runescape_launcher" in active_sw:
+        run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape_launcher")')
+
+def action_status():
+    ensure_daemon_running()
+    client = get_runelite_client()
+    state = safe_read_state()
+    jagex_running = is_jagex_launcher_running()
+
+    if client:
+        ensure_jagex_launcher_hidden()
+        title = client.get("title", "")
+        char_name = ""
+        if " - " in title:
+            char_name = title.split(" - ", 1)[1].strip()
+        state["running"] = True
+        state["character"] = char_name or state.get("character", "DarkOmenZA")
+        state["address"] = client.get("address", "")
+        ws = client.get("workspace", {}).get("name", "")
+        if "special:runescape" in ws:
+            state["mode"] = "popup"
+        else:
+            state["mode"] = "normal"
+    else:
+        state["running"] = False
+        state["popupOpen"] = False
+
+    state["launcherRunning"] = jagex_running
+    state["lastUpdated"] = int(time.time() * 1000)
+    safe_write_state(state)
+    return state
+
+def action_toggle():
+    client = get_runelite_client()
+    state = safe_read_state()
+    if not client:
+        return {"ok": False, "error": "RuneLite is not running", "running": False}
+
+    active_sw = get_active_special_workspace()
+    is_open = ("runescape" in active_sw)
+    now = time.time()
+    last_dismiss = float(state.get("lastDismissTime", 0))
+
+    # If the window was dismissed within the last 400ms (e.g. from clicking the bar,
+    # which caused activewindow focus-loss right before this toggle handler fired),
+    # do NOT re-open it. The user's action was to close it.
+    if not is_open and (now - last_dismiss) < 0.4:
+        state["popupOpen"] = False
+        state["lastUpdated"] = int(now * 1000)
+        safe_write_state(state)
+        return {"ok": True, "popupOpen": False}
+
+    # Close launcher scratchpad if visible
+    if "runescape_launcher" in active_sw:
+        run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape_launcher")')
+
+    # Toggle the RuneLite game screen
+    run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
+    state["popupOpen"] = not is_open
+    if state["popupOpen"]:
+        state["alert"] = False
+        state["alertMessage"] = ""
+    else:
+        state["lastDismissTime"] = now
+
+    state["running"] = True
+    state["lastUpdated"] = int(now * 1000)
+    safe_write_state(state)
+    return {"ok": True, "popupOpen": state["popupOpen"]}
+
+def action_dismiss():
+    state = safe_read_state()
+    active_sw = get_active_special_workspace()
+    now = time.time()
+    # Idempotent dismiss: only toggle if it is actually open!
+    if "runescape" in active_sw:
+        run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
+    state["popupOpen"] = False
+    state["lastDismissTime"] = now
+    state["lastUpdated"] = int(now * 1000)
+    safe_write_state(state)
+    return {"ok": True, "popupOpen": False}
+
+def action_detach(ws="5"):
+    lua_detach = f"""
+    for _, w in ipairs(hl.get_windows()) do
+      if w.class:find("runelite") or w.class:find("net-runelite") then
+        hl.dispatch(hl.dsp.window.move({{ window = w, workspace = "{ws}", follow = true }}))
+        hl.dispatch(hl.dsp.window.center({{ window = w }}))
+        break
+      end
+    end
+    """
+    run_hypr_eval(lua_detach)
+    active_sw = get_active_special_workspace()
+    if "runescape" in active_sw:
+        run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
+    state = safe_read_state()
+    state["popupOpen"] = False
+    state["mode"] = "normal"
+    safe_write_state(state)
+    return {"ok": True, "mode": "normal", "workspace": ws}
+
+def action_dock():
+    lua_dock = f"""
+    for _, w in ipairs(hl.get_windows()) do
+      if w.class:find("runelite") or w.class:find("net-runelite") then
+        hl.dispatch(hl.dsp.window.move({{ window = w, workspace = "special:runescape", follow = false }}))
+        hl.dispatch(hl.dsp.window.resize({{ window = w, x = {POPUP_W}, y = {POPUP_H}, relative = false }}))
+        hl.dispatch(hl.dsp.window.move({{ window = w, x = {POPUP_X}, y = {POPUP_Y}, relative = false }}))
+        break
+      end
+    end
+    """
+    run_hypr_eval(lua_dock)
+    state = safe_read_state()
+    state["mode"] = "popup"
+    safe_write_state(state)
+    return {"ok": True, "mode": "popup"}
+
+def action_toggle_launcher():
+    """
+    Toggles visibility of Jagex Launcher (in special:runescape_launcher).
+    """
+    run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape_launcher")')
+    return {"ok": True}
+
+def action_quit():
+    """
+    Terminates both RuneLite and Jagex Launcher cleanly when requested.
+    """
+    try:
+        subprocess.run(["pkill", "-f", "RuneLite"], capture_output=True)
+        subprocess.run(["pkill", "-f", "jagex-launcher"], capture_output=True)
+    except Exception:
+        pass
+    state = safe_read_state()
+    state["running"] = False
+    state["launcherRunning"] = False
+    state["popupOpen"] = False
+    state["alert"] = False
+    safe_write_state(state)
+    return {"ok": True}
+
+def action_launch():
+    env = os.environ.copy()
+    env["GDK_SCALE"] = "1"
+    env["_JAVA_OPTIONS"] = "-Dsun.java2d.uiScale=1.0"
+
+    target_app = find_jagex_launcher() or find_runelite()
+    if not target_app:
+        return {"ok": False, "error": "Neither Jagex Launcher nor RuneLite executable was found."}
+    try:
+        subprocess.Popen([target_app], env=env, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        state = safe_read_state()
+        state["launcherRunning"] = True
+        safe_write_state(state)
+        return {"ok": True, "launched": target_app}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def action_launch_runelite_direct():
+    env = os.environ.copy()
+    env["GDK_SCALE"] = "1"
+    env["_JAVA_OPTIONS"] = "-Dsun.java2d.uiScale=1.0"
+
+    target_app = find_runelite()
+    if not target_app:
+        return {"ok": False, "error": "RuneLite executable was not found."}
+    try:
+        subprocess.Popen([target_app], env=env, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"ok": True, "launched": target_app}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def action_clear_alert():
+    state = safe_read_state()
+    state["alert"] = False
+    state["alertMessage"] = ""
+    safe_write_state(state)
+    return {"ok": True}
+
+def check_notifications():
+    if not NOTIF_DIR.exists():
+        return None
+    try:
+        now = time.time()
+        for f in NOTIF_DIR.glob("*.json"):
+            if f.is_file() and (now - f.stat().st_mtime) < 15:
+                try:
+                    with open(f, "r", encoding="utf-8") as nf:
+                        data = json.load(nf)
+                    app = str(data.get("app", "")).lower()
+                    summary = str(data.get("summary", "")).lower()
+                    body = str(data.get("body", "")).lower()
+                    text = f"{app} {summary} {body}"
+                    if "runelite" in app or "mining" in text or "idle" in text or "woodcutting" in text or "afk" in text:
+                        return data.get("summary") or data.get("body") or "Idle Notification"
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return None
+
+def run_daemon():
+    # Enforce singleton
+    if PID_FILE.exists():
+        try:
+            old_pid = int(PID_FILE.read_text().strip())
+            os.kill(old_pid, 0)
+            print(f"Daemon already running with PID {old_pid}")
+            return
+        except (ProcessLookupError, ValueError):
+            PID_FILE.unlink(missing_ok=True)
+
+    PID_FILE.write_text(str(os.getpid()))
+
+    xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    sock_path = f"{xdg}/hypr/{sig}/.socket2.sock"
+
+    sock = None
+    last_reconnect = 0
+    last_poll = 0
+    buffer = ""
+
+    print(f"RuneScape Daemon started (PID {os.getpid()})")
+
+    try:
+        while True:
+            now = time.time()
+
+            # Connect socket2 if needed
+            if not sock and (now - last_reconnect) > 2:
+                last_reconnect = now
+                try:
+                    if Path(sock_path).exists():
+                        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                        sock.connect(sock_path)
+                        sock.setblocking(False)
+                except Exception:
+                    sock = None
+
+            # Periodic state sync & notification directory check
+            if now - last_poll > 3:
+                last_poll = now
+                notif_alert = check_notifications()
+                state = safe_read_state()
+                client = get_runelite_client()
+
+                modified = False
+                if client:
+                    ensure_jagex_launcher_hidden()
+                    if not state.get("running"):
+                        state["running"] = True
+                        modified = True
+                    char_name = ""
+                    title = client.get("title", "")
+                    if " - " in title:
+                        char_name = title.split(" - ", 1)[1].strip()
+                    if char_name and state.get("character") != char_name:
+                        state["character"] = char_name
+                        modified = True
+                else:
+                    if state.get("running"):
+                        state["running"] = False
+                        state["popupOpen"] = False
+                        modified = True
+
+                if notif_alert and not state.get("alert"):
+                    state["alert"] = True
+                    state["alertMessage"] = notif_alert
+                    modified = True
+
+                if modified:
+                    safe_write_state(state)
+
+            # Read socket events
+            readable = []
+            if sock:
+                readable, _, _ = select.select([sock], [], [], 1.0)
+            else:
+                time.sleep(1.0)
+
+            if sock and readable:
+                try:
+                    data = sock.recv(4096).decode("utf-8", errors="ignore")
+                    if not data:
+                        sock.close()
+                        sock = None
+                        continue
+                    buffer += data
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+
+                        # Handle activewindow: auto-hide popup when clicking outside
+                        if line.startswith("activewindow>>"):
+                            payload = line[len("activewindow>>"):]
+                            parts = payload.split(",", 1)
+                            active_cls = parts[0].strip().lower()
+                            state = safe_read_state()
+                            if state.get("popupOpen") and ("runelite" not in active_cls and active_cls != "net-runelite-launcher-launcher"):
+                                # Focus lost: dismiss popup
+                                active_sw = get_active_special_workspace()
+                                if "runescape" in active_sw:
+                                    run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
+                                now = time.time()
+                                state["popupOpen"] = False
+                                state["lastDismissTime"] = now
+                                state["lastUpdated"] = int(now * 1000)
+                                safe_write_state(state)
+
+                        # Handle workspace change: dismiss popup
+                        elif line.startswith("workspace>>"):
+                            state = safe_read_state()
+                            if state.get("popupOpen"):
+                                active_sw = get_active_special_workspace()
+                                if "runescape" in active_sw:
+                                    run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
+                                now = time.time()
+                                state["popupOpen"] = False
+                                state["lastDismissTime"] = now
+                                state["lastUpdated"] = int(now * 1000)
+                                safe_write_state(state)
+
+                        # Handle openwindow: when RuneLite opens, hide Jagex Launcher immediately
+                        elif line.startswith("openwindow>>"):
+                            payload = line[len("openwindow>>"):]
+                            parts = payload.split(",", 3)
+                            if len(parts) >= 3:
+                                opened_cls = parts[2].strip().lower()
+                                if "runelite" in opened_cls:
+                                    ensure_jagex_launcher_hidden()
+
+                        # Handle urgency hint: flash icon
+                        elif line.startswith("urgent>>"):
+                            addr = line[len("urgent>>"):].strip()
+                            state = safe_read_state()
+                            client = get_runelite_client()
+                            if client and client.get("address") == addr:
+                                state["alert"] = True
+                                state["alertMessage"] = "Idle / Attention Required"
+                                safe_write_state(state)
+
+                        # Handle client close
+                        elif line.startswith("closewindow>>"):
+                            addr = line[len("closewindow>>"):].strip()
+                            state = safe_read_state()
+                            if state.get("address") == addr:
+                                state["running"] = False
+                                state["popupOpen"] = False
+                                safe_write_state(state)
+                except Exception as e:
+                    if sock:
+                        sock.close()
+                    sock = None
+
+    finally:
+        PID_FILE.unlink(missing_ok=True)
+
+def ensure_daemon_running():
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            os.kill(pid, 0)
+            return
+        except (ProcessLookupError, ValueError):
+            PID_FILE.unlink(missing_ok=True)
+
+    # Spawn daemon
+    script_path = os.path.abspath(__file__)
+    subprocess.Popen([sys.executable, script_path, "daemon"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "daemon":
+        run_daemon()
+        return
+
+    # Standard JSON over stdin dispatch
+    raw_line = sys.stdin.readline(MAX_STDIN_BYTES)
+    if not raw_line or not raw_line.strip():
+        # Default to status if no stdin
+        res = action_status()
+        print(json.dumps(res))
+        return
+
+    try:
+        req = json.loads(raw_line)
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": f"Invalid JSON: {e}"}))
+        sys.exit(1)
+
+    action = req.get("action", "status")
+
+    if action == "status":
+        res = action_status()
+    elif action == "toggle":
+        res = action_toggle()
+    elif action == "dismiss":
+        res = action_dismiss()
+    elif action == "detach":
+        res = action_detach(req.get("workspace", "5"))
+    elif action == "dock":
+        res = action_dock()
+    elif action == "launch":
+        res = action_launch()
+    elif action == "launch_runelite":
+        res = action_launch_runelite_direct()
+    elif action == "toggle_launcher":
+        res = action_toggle_launcher()
+    elif action == "quit":
+        res = action_quit()
+    elif action == "clear_alert":
+        res = action_clear_alert()
+    else:
+        res = {"ok": False, "error": f"Unknown action: {action}"}
+
+    print(json.dumps(res))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "id": "cjkaufman.runescape",
+  "name": "RuneScape Quick-Screen",
+  "version": "1.0.0",
+  "author": "Carl Kaufman",
+  "license": "MIT",
+  "description": "Quick-access popup scratchpad, Jagex account launcher, and AFK/idle notification flasher for Old School RuneScape (RuneLite).",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "RuneScape",
+    "description": "Old School RuneScape bar widget with popup scratchpad view, Jagex launcher login, and flashing idle alerts.",
+    "category": "Games",
+    "aliases": ["osrs", "runescape", "runelite", "jagex"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "popupWidth": 840,
+      "popupHeight": 600,
+      "popupX": 680,
+      "popupY": 34,
+      "autoHideOnBlur": true,
+      "flashOnAlert": true
+    },
+    "schema": [
+      {
+        "key": "popupWidth",
+        "type": "integer",
+        "label": "Popup Width (px)",
+        "min": 600,
+        "max": 1400,
+        "step": 20,
+        "defaultValue": 840,
+        "description": "Width of the floating game popup window."
+      },
+      {
+        "key": "popupHeight",
+        "type": "integer",
+        "label": "Popup Height (px)",
+        "min": 400,
+        "max": 900,
+        "step": 20,
+        "defaultValue": 600,
+        "description": "Height of the floating game popup window."
+      },
+      {
+        "key": "autoHideOnBlur",
+        "type": "boolean",
+        "label": "Auto-hide when clicking outside",
+        "defaultValue": true,
+        "description": "Automatically dismiss the game screen back to background when focus shifts to another window or desktop."
+      },
+      {
+        "key": "flashOnAlert",
+        "type": "boolean",
+        "label": "Flash bar icon on AFK / idle",
+        "defaultValue": true,
+        "description": "Pulsing amber/red flashing animation when you stop mining or go idle."
+      }
+    ]
+  }
+}

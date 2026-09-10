@@ -1,0 +1,18 @@
+# Local state and runtime data
+state.json
+.state.tmp*
+*.pid
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# OS and editor files
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
