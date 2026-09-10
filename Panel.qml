@@ -122,6 +122,7 @@ Panel {
           if (res.popupOpen !== undefined) root.popupOpen = res.popupOpen === true
           if (res.alert !== undefined) root.alert = res.alert === true
           if (res.alertMessage !== undefined) root.alertMessage = res.alertMessage
+          if (res.showCharacterName !== undefined) root.showCharacterName = res.showCharacterName === true
         } catch (e) {}
       }
     }

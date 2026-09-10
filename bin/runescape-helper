@@ -358,8 +358,8 @@ def action_set_config(data):
 
 def check_notifications(state):
     notif_dirs = [NOTIF_DIR / "history", NOTIF_DIR]
-    last_id = int(state.get("lastNotifId", 0))
-    highest_id = last_id
+    last_ts = int(state.get("lastNotifTime", 0))
+    highest_ts = last_ts
     alert_msg = None
 
     for d in notif_dirs:
@@ -369,14 +369,14 @@ def check_notifications(state):
             try:
                 fname = f.name
                 if "-" in fname and fname.endswith(".json"):
-                    id_part = fname.rsplit("-", 1)[1][:-5]
-                    if id_part.isdigit() and int(id_part) <= last_id:
+                    ts_part = fname.split("-", 1)[0]
+                    if ts_part.isdigit() and int(ts_part) <= last_ts:
                         continue
 
                 with open(f, "r", encoding="utf-8") as nf:
                     data = json.load(nf)
-                nid = int(data.get("id", 0))
-                if nid <= last_id:
+                ts = int(data.get("timestamp", 0))
+                if ts <= last_ts:
                     continue
 
                 app = str(data.get("app", "")).lower()
@@ -385,15 +385,15 @@ def check_notifications(state):
                 text = f"{app} {summary} {body}"
 
                 if "runelite" in app or "runescape" in app or "mining" in text or "idle" in text or "woodcutting" in text or "fishing" in text or "combat" in text or "afk" in text:
-                    if nid > highest_id:
-                        highest_id = nid
+                    if ts > highest_ts:
+                        highest_ts = ts
                         alert_msg = data.get("body") or data.get("summary") or "AFK / Idle Alert"
             except Exception:
                 continue
 
     if alert_msg:
-        return True, alert_msg, highest_id
-    return False, "", highest_id
+        return True, alert_msg, highest_ts
+    return False, "", highest_ts
 
 def run_daemon():
     # Enforce singleton
@@ -419,17 +419,8 @@ def run_daemon():
 
     # Initialize notification baseline so we don't alert on old history
     init_state = safe_read_state()
-    if init_state.get("lastNotifId", 0) == 0:
-        max_id = 0
-        for d in [NOTIF_DIR / "history", NOTIF_DIR]:
-            if d.exists():
-                for f in d.glob("*.json"):
-                    fname = f.name
-                    if "-" in fname and fname.endswith(".json"):
-                        p = fname.rsplit("-", 1)[1][:-5]
-                        if p.isdigit():
-                            max_id = max(max_id, int(p))
-        init_state["lastNotifId"] = max_id
+    if init_state.get("lastNotifTime", 0) == 0:
+        init_state["lastNotifTime"] = int(time.time() * 1000)
         safe_write_state(init_state)
 
     print(f"RuneScape Daemon started (PID {os.getpid()})")
@@ -457,8 +448,8 @@ def run_daemon():
                 client = get_runelite_client()
 
                 modified = False
-                if highest_id > state.get("lastNotifId", 0):
-                    state["lastNotifId"] = highest_id
+                if highest_id > state.get("lastNotifTime", 0):
+                    state["lastNotifTime"] = highest_id
                     modified = True
 
                 if has_alert and not state.get("alert"):
@@ -600,19 +591,17 @@ def main():
         run_daemon()
         return
 
-    # Standard JSON over stdin dispatch
-    raw_line = sys.stdin.readline(MAX_STDIN_BYTES)
-    if not raw_line or not raw_line.strip():
-        # Default to status if no stdin
-        res = action_status()
-        print(json.dumps(res))
-        return
-
-    try:
-        req = json.loads(raw_line)
-    except Exception as e:
-        print(json.dumps({"ok": False, "error": f"Invalid JSON: {e}"}))
-        sys.exit(1)
+    req = {}
+    if len(sys.argv) > 1 and sys.argv[1] != "daemon":
+        req = {"action": sys.argv[1]}
+    elif not sys.stdin.isatty():
+        raw_line = sys.stdin.readline(MAX_STDIN_BYTES)
+        if raw_line and raw_line.strip():
+            try:
+                req = json.loads(raw_line)
+            except Exception as e:
+                print(json.dumps({"ok": False, "error": f"Invalid JSON: {e}"}))
+                sys.exit(1)
 
     action = req.get("action", "status")
 

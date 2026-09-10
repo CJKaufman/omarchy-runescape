@@ -2,7 +2,17 @@
 
 A native Omarchy top-bar applet and floating scratchpad controller for Old School RuneScape (OSRS / RuneLite). Designed for seamless AFK skilling (mining, woodcutting, fishing, combat) while working, browsing, or coding.
 
-![RuneScape Bar Widget](icon.png)
+<p align="center">
+  <img src="docs/demo.gif" alt="RuneScape Quick-Screen Demo" width="100%"/>
+</p>
+
+## Showcase
+
+| Quick-Screen Floating Overlay | Quick Controls & Display Toggle |
+|:---:|:---:|
+| <img src="docs/scratchpad-overlay.png" alt="Floating Scratchpad Overlay" width="100%"/> | <img src="docs/menu-settings.png" alt="Quick Controls and Display Toggle" width="100%"/> |
+
+---
 
 ## Features
 
@@ -95,6 +105,7 @@ Configurable via Omarchy shell settings or `~/.config/omarchy/shell.json`:
 | `popupHeight` | integer | `600` | Height of the floating game popup window (px) |
 | `autoHideOnBlur` | boolean | `true` | Auto-dismiss game screen when clicking outside |
 | `flashOnAlert` | boolean | `true` | Pulsing animation on top-bar icon during AFK alerts |
+| `showCharacterName` | boolean | `true` | Display character name alongside icon, or icon-only mode |
 
 ---
 
