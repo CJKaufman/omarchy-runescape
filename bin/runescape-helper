@@ -21,22 +21,87 @@ STATE_FILE = STATE_DIR / "state.json"
 PID_FILE = Path(f"/run/user/{os.getuid()}/runescape-helper.pid")
 NOTIF_DIR = Path.home() / ".local/state/omarchy/notifications"
 
+def send_desktop_notification(summary, body, urgency="normal"):
+    try:
+        subprocess.run(["notify-send", "-u", urgency, "-a", "RuneScape", summary, body], timeout=2)
+    except Exception:
+        pass
+
+def ensure_executable(path):
+    if not path:
+        return path
+    try:
+        p = Path(path)
+        if p.exists() and p.is_file():
+            if not os.access(str(p), os.X_OK):
+                current_mode = p.stat().st_mode
+                p.chmod(current_mode | 0o755)
+    except Exception as e:
+        print(f"Could not chmod +x {path}: {e}", file=sys.stderr)
+    return str(path)
+
+def check_for_windows_installer():
+    search_roots = [Path.home() / "Downloads", Path.home() / "Desktop"]
+    for root_dir in search_roots:
+        if not root_dir.exists():
+            continue
+        try:
+            for f in root_dir.rglob("*"):
+                if f.is_file() and "jagex" in f.name.lower() and f.name.lower().endswith(".exe"):
+                    return str(f)
+        except Exception:
+            pass
+    return None
+
 def find_jagex_launcher():
+    # 1. Standard candidate locations
     candidates = [
         shutil.which("jagex-launcher"),
-        Path.home() / "Downloads/Game Downloads/jagex-launcher-beta-linux-x86_64.AppImage",
-        Path.home() / "Downloads/jagex-launcher-beta-linux-x86_64.AppImage",
+        shutil.which("jagexlauncher"),
         Path.home() / ".local/bin/jagex-launcher",
         Path.home() / ".local/share/Jagex Launcher/jagex-launcher",
     ]
     for c in candidates:
-        if c and Path(c).exists():
-            return str(c)
-    downloads = Path.home() / "Downloads"
-    if downloads.exists():
-        for f in downloads.rglob("*jagex*launcher*.AppImage"):
-            if f.is_file():
-                return str(f)
+        if c and Path(c).exists() and Path(c).is_file():
+            return ensure_executable(str(c))
+
+    # 2. Search common user directories (case-insensitive)
+    search_roots = [
+        Path.home() / "Downloads",
+        Path.home() / "Desktop",
+        Path.home() / "Applications",
+        Path.home() / "Games",
+        Path.home() / ".local/share/Jagex Launcher",
+    ]
+
+    found_appimages = []
+    found_executables = []
+
+    for root_dir in search_roots:
+        if not root_dir.exists():
+            continue
+        try:
+            for f in root_dir.rglob("*"):
+                if not f.is_file():
+                    continue
+                name_lower = f.name.lower()
+                if "jagex" in name_lower:
+                    if name_lower.endswith(".appimage"):
+                        found_appimages.append((f.stat().st_mtime, f))
+                    elif not name_lower.endswith((".exe", ".txt", ".png", ".jpg", ".zip", ".tar.gz", ".deb", ".rpm")):
+                        if os.access(str(f), os.X_OK):
+                            found_executables.append((f.stat().st_mtime, f))
+        except Exception:
+            pass
+
+    if found_appimages:
+        found_appimages.sort(key=lambda x: x[0], reverse=True)
+        return ensure_executable(str(found_appimages[0][1]))
+
+    if found_executables:
+        found_executables.sort(key=lambda x: x[0], reverse=True)
+        return ensure_executable(str(found_executables[0][1]))
+
     return None
 
 def find_runelite():
@@ -50,8 +115,28 @@ def find_runelite():
         Path.home() / ".local/share/flatpak/exports/bin/net.runelite.RuneLite",
     ]
     for c in candidates:
-        if c and Path(c).exists():
-            return str(c)
+        if c and Path(c).exists() and Path(c).is_file():
+            return ensure_executable(str(c))
+
+    search_roots = [
+        Path.home() / "Downloads",
+        Path.home() / "Desktop",
+        Path.home() / "Applications",
+        Path.home() / "Games",
+        Path.home() / ".local/share",
+    ]
+    for root_dir in search_roots:
+        if not root_dir.exists():
+            continue
+        try:
+            for f in root_dir.rglob("*"):
+                if not f.is_file():
+                    continue
+                name_lower = f.name.lower()
+                if "runelite" in name_lower and name_lower.endswith(".appimage"):
+                    return ensure_executable(str(f))
+        except Exception:
+            pass
     return None
 
 POPUP_W = 840
@@ -311,6 +396,34 @@ def action_quit():
     safe_write_state(state)
     return {"ok": True}
 
+def launch_binary(target_app, env):
+    ensure_state_dir()
+    log_file = STATE_DIR / "launcher.log"
+    ensure_executable(target_app)
+
+    has_fuse2 = False
+    for lib_dir in ["/usr/lib", "/usr/lib64", "/lib", "/lib64"]:
+        if Path(f"{lib_dir}/libfuse.so.2").exists():
+            has_fuse2 = True
+            break
+
+    cmd = [target_app]
+    if not has_fuse2 and target_app.lower().endswith(".appimage"):
+        cmd.append("--appimage-extract-and-run")
+
+    with open(log_file, "a", encoding="utf-8") as out:
+        out.write(f"\n--- Launching {target_app} at {time.ctime()} ---\n")
+        out.write(f"Command: {' '.join(cmd)}\n")
+        out.flush()
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            start_new_session=True,
+            stdout=out,
+            stderr=subprocess.STDOUT
+        )
+        return proc
+
 def action_launch():
     env = os.environ.copy()
     env["GDK_SCALE"] = "1"
@@ -318,15 +431,23 @@ def action_launch():
 
     target_app = find_jagex_launcher() or find_runelite()
     if not target_app:
-        return {"ok": False, "error": "Neither Jagex Launcher nor RuneLite executable was found."}
+        win_installer = check_for_windows_installer()
+        if win_installer:
+            err = f"Found Windows installer ({Path(win_installer).name}) in Downloads, but Linux requires the Linux AppImage from Jagex."
+        else:
+            err = "Neither Jagex Launcher nor RuneLite AppImage was found in ~/Downloads or PATH."
+        send_desktop_notification("RuneScape Launch Error", err, urgency="critical")
+        return {"ok": False, "error": err}
     try:
-        subprocess.Popen([target_app], env=env, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        launch_binary(target_app, env)
         state = safe_read_state()
         state["launcherRunning"] = True
         safe_write_state(state)
         return {"ok": True, "launched": target_app}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        err = f"Failed to start {Path(target_app).name}: {e}"
+        send_desktop_notification("RuneScape Launch Error", err, urgency="critical")
+        return {"ok": False, "error": err}
 
 def action_launch_runelite_direct():
     env = os.environ.copy()
@@ -335,12 +456,16 @@ def action_launch_runelite_direct():
 
     target_app = find_runelite()
     if not target_app:
-        return {"ok": False, "error": "RuneLite executable was not found."}
+        err = "RuneLite AppImage or binary was not found in ~/Downloads or PATH."
+        send_desktop_notification("RuneScape Launch Error", err, urgency="critical")
+        return {"ok": False, "error": err}
     try:
-        subprocess.Popen([target_app], env=env, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        launch_binary(target_app, env)
         return {"ok": True, "launched": target_app}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        err = f"Failed to start RuneLite: {e}"
+        send_desktop_notification("RuneScape Launch Error", err, urgency="critical")
+        return {"ok": False, "error": err}
 
 def action_clear_alert():
     state = safe_read_state()
