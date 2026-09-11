@@ -344,34 +344,38 @@ def action_toggle():
     if active_sw == "special:runescape_launcher":
         run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape_launcher")')
 
-    # Toggle the RuneLite game screen
-    run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
-    state["popupOpen"] = not is_open
-    if state["popupOpen"]:
+    target_open = not is_open
+    state["popupOpen"] = target_open
+    state["running"] = True
+    state["lastUpdated"] = int(now * 1000)
+
+    if target_open:
         state["alert"] = False
         state["alertMessage"] = ""
+        state["openedAt"] = now
+        # Write state BEFORE dispatching to prevent any race condition in the daemon
+        safe_write_state(state)
+        run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
         ensure_runelite_geometry()
     else:
         state["lastDismissTime"] = now
+        safe_write_state(state)
+        run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
         refocus_active_workspace()
 
-    state["running"] = True
-    state["lastUpdated"] = int(now * 1000)
-    safe_write_state(state)
     return {"ok": True, "popupOpen": state["popupOpen"]}
 
 def action_dismiss():
     state = safe_read_state()
     active_sw = get_active_special_workspace()
     now = time.time()
-    # Idempotent dismiss: only toggle if it is actually open!
-    if active_sw == "special:runescape":
-        run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
-    refocus_active_workspace()
     state["popupOpen"] = False
     state["lastDismissTime"] = now
     state["lastUpdated"] = int(now * 1000)
     safe_write_state(state)
+    if active_sw == "special:runescape":
+        run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
+    refocus_active_workspace()
     return {"ok": True, "popupOpen": False}
 
 def action_detach(ws="5"):
@@ -646,8 +650,13 @@ def run_daemon():
                 # Keep popupOpen in sync with special:runescape visibility
                 active_sw_poll = get_active_special_workspace()
                 is_sw_visible = (active_sw_poll == "special:runescape")
-                if state.get("popupOpen") != is_sw_visible:
-                    state["popupOpen"] = is_sw_visible
+                now_poll = time.time()
+                opened_at_poll = float(state.get("openedAt", 0))
+                if state.get("popupOpen") and not is_sw_visible and (now_poll - opened_at_poll) >= 1.0:
+                    state["popupOpen"] = False
+                    modified = True
+                elif not state.get("popupOpen") and is_sw_visible:
+                    state["popupOpen"] = True
                     modified = True
 
                 if modified:
@@ -680,6 +689,7 @@ def run_daemon():
                             parts = payload.split(",", 1)
                             active_cls = parts[0].strip().lower()
                             state = safe_read_state()
+                            now = time.time()
                             is_runelite = ("runelite" in active_cls or active_cls == "net-runelite-launcher-launcher")
 
                             # User focused or clicked inside RuneLite: clear alert!
@@ -688,36 +698,34 @@ def run_daemon():
                                 state["alertMessage"] = ""
                                 safe_write_state(state)
 
-                            # If RuneLite received focus but popup was not requested,
-                            # a rogue focus event (e.g. closing another bar plugin) brought it up.
-                            # Dismiss it immediately and restore focus to the workspace window.
-                            if is_runelite and not state.get("popupOpen"):
-                                active_sw = get_active_special_workspace()
-                                if active_sw == "special:runescape":
-                                    run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
-                                    refocus_active_workspace()
+                            opened_at = float(state.get("openedAt", 0))
 
-                            elif state.get("popupOpen") and not is_runelite:
-                                # Focus lost: dismiss popup
+                            # Focus lost auto-dismiss:
+                            # Only trigger if:
+                            # 1) popup is currently marked open
+                            # 2) not RuneLite
+                            # 3) active_cls is a non-empty window class (not bar or layer surface)
+                            # 4) grace period of 1.2s has elapsed since user opened the popup
+                            if state.get("popupOpen") and not is_runelite and active_cls != "" and (now - opened_at) >= 1.2:
                                 active_sw = get_active_special_workspace()
                                 if active_sw == "special:runescape":
                                     run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
                                 refocus_active_workspace()
-                                now = time.time()
                                 state["popupOpen"] = False
                                 state["lastDismissTime"] = now
                                 state["lastUpdated"] = int(now * 1000)
                                 safe_write_state(state)
 
-                        # Handle workspace change: dismiss popup
+                        # Handle workspace change: dismiss popup if switching workspace
                         elif line.startswith("workspace>>"):
                             state = safe_read_state()
-                            if state.get("popupOpen"):
+                            now = time.time()
+                            opened_at = float(state.get("openedAt", 0))
+                            if state.get("popupOpen") and (now - opened_at) >= 0.8:
                                 active_sw = get_active_special_workspace()
                                 if active_sw == "special:runescape":
                                     run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
                                 refocus_active_workspace()
-                                now = time.time()
                                 state["popupOpen"] = False
                                 state["lastDismissTime"] = now
                                 state["lastUpdated"] = int(now * 1000)
