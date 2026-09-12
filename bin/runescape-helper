@@ -343,11 +343,12 @@ def refocus_active_workspace():
     local active_ws = hl.get_active_workspace()
     if not active_ws then return end
     for _, w in ipairs(hl.get_windows()) do
-      if w.workspace and w.workspace.id == active_ws.id then
-        hl.dispatch(hl.dsp.focus({ window = w }))
+      if w.workspace and w.workspace.id == active_ws.id and w.mapped and not w.hidden then
+        hl.dispatch(hl.dsp.focus({ window = "address:" .. w.address }))
         return
       end
     end
+    hl.dispatch(hl.dsp.focus({ workspace = active_ws.name }))
     """
     run_hypr_eval(lua)
 
@@ -372,7 +373,7 @@ def ensure_runelite_geometry(w=POPUP_W, h=POPUP_H):
     local target_addr = "{addr}"
     for _, win in ipairs(hl.get_windows()) do
       if win.address == target_addr then
-        hl.dispatch(hl.dsp.focus({{ window = win }}))
+        hl.dispatch(hl.dsp.focus({{ window = "address:" .. target_addr }}))
         local act = hl.get_active_window()
         if act and act.address == target_addr then
           hl.dispatch(hl.dsp.window.move({{ x = {pos_x}, y = {pos_y}, relative = false }}))
@@ -789,9 +790,10 @@ def run_daemon():
                     state["popupOpen"] = False
                     state["hasGainedFocus"] = False
                     modified = True
-                elif not state.get("popupOpen") and is_sw_visible:
-                    state["popupOpen"] = True
-                    modified = True
+                elif not state.get("popupOpen") and is_sw_visible and (now_poll - opened_at_poll) >= 1.0:
+                    # Rogue visibility: immediately hide it and refocus
+                    run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
+                    refocus_active_workspace()
 
                 if modified:
                     safe_write_state(state)
@@ -825,21 +827,30 @@ def run_daemon():
                             state = safe_read_state()
                             now = time.time()
                             is_runelite = ("runelite" in active_cls or active_cls == "net-runelite-launcher-launcher")
-
-                            # User focused or clicked inside RuneLite: clear alert and mark hasGainedFocus
-                            if is_runelite:
-                                modified = False
-                                if state.get("alert"):
-                                    state["alert"] = False
-                                    state["alertMessage"] = ""
-                                    modified = True
-                                if not state.get("hasGainedFocus"):
-                                    state["hasGainedFocus"] = True
-                                    modified = True
-                                if modified:
-                                    safe_write_state(state)
-
                             opened_at = float(state.get("openedAt", 0))
+
+                            # User focused or clicked inside RuneLite
+                            if is_runelite:
+                                # Rogue focus guard: if popup was NOT requested open,
+                                # an unmapped overlay (like Google Tasks or Logitech closing)
+                                # gave focus to RuneLite in Hyprland's focus stack.
+                                # Immediately tuck it back into the special workspace!
+                                if not state.get("popupOpen") and (now - opened_at) >= 1.0:
+                                    active_sw = get_active_special_workspace()
+                                    if active_sw == "special:runescape":
+                                        run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
+                                    refocus_active_workspace()
+                                else:
+                                    modified = False
+                                    if state.get("alert"):
+                                        state["alert"] = False
+                                        state["alertMessage"] = ""
+                                        modified = True
+                                    if not state.get("hasGainedFocus"):
+                                        state["hasGainedFocus"] = True
+                                        modified = True
+                                    if modified:
+                                        safe_write_state(state)
 
                             # Focus lost auto-dismiss:
                             # CRITICAL SAFETY: Only auto-dismiss if:

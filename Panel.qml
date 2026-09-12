@@ -10,6 +10,18 @@ Panel {
   id: root
   moduleName: "cjkaufman.runescape"
   ipcTarget: "cjkaufman.runescape"
+  manageIpc: false
+
+  IpcHandler {
+    target: root.ipcTarget
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function togglePopup(): void { root.togglePopup() }
+    function dismissPopup(): void { root.dismissPopup() }
+  }
 
   // Glyphs & Icons (JetBrainsMono Nerd Font)
   readonly property string glyphCrossSwords: String.fromCodePoint(0xF0787) // Iconic OSRS crossed swords
@@ -198,6 +210,8 @@ Panel {
 
   implicitWidth: barButton.implicitWidth
   implicitHeight: barButton.implicitHeight
+  width: implicitWidth
+  height: implicitHeight
 
   // Top Bar Button
   WidgetButton {
