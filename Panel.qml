@@ -178,6 +178,24 @@ Panel {
     sendAction("quit")
   }
 
+  function persistSettings(values) {
+    var entry = { id: root.moduleName }
+    for (var existing in root.settings) if (existing !== "id") entry[existing] = root.settings[existing]
+    for (var key in values) entry[key] = values[key]
+
+    root.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function") {
+      root.bar.shell.updateEntryInline(root.moduleName, entry)
+    }
+  }
+
+  function toggleCharacterNameDisplay() {
+    var nextVal = !root.showCharacterName
+    root.showCharacterName = nextVal
+    persistSettings({ showCharacterName: nextVal })
+    sendAction("set_config", { showCharacterName: nextVal })
+  }
+
   implicitWidth: barButton.implicitWidth
   implicitHeight: barButton.implicitHeight
 
@@ -432,10 +450,7 @@ Panel {
                   anchors.fill: parent
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: {
-                    root.showCharacterName = !root.showCharacterName
-                    root.sendAction("set_config", { showCharacterName: root.showCharacterName })
-                  }
+                  onClicked: root.toggleCharacterNameDisplay()
                 }
 
                 Text {

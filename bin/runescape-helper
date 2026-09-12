@@ -164,7 +164,48 @@ def safe_write_state(state):
             tmp_file.unlink(missing_ok=True)
         print(f"Failed to write state: {e}", file=sys.stderr)
 
+def read_shell_json_setting():
+    shell_json = Path.home() / ".config/omarchy/shell.json"
+    if shell_json.exists():
+        try:
+            with open(shell_json, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            sections = data.get("bar", {}).get("layout", {})
+            for sec in ["left", "center", "right"]:
+                for item in sections.get(sec, []):
+                    if isinstance(item, dict) and item.get("id") == "cjkaufman.runescape":
+                        if "showCharacterName" in item:
+                            return bool(item["showCharacterName"])
+        except Exception:
+            pass
+    return True
+
+def update_shell_json_setting(show_character_name):
+    shell_json = Path.home() / ".config/omarchy/shell.json"
+    if not shell_json.exists():
+        return
+    try:
+        with open(shell_json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        modified = False
+        sections = data.get("bar", {}).get("layout", {})
+        for sec in ["left", "center", "right"]:
+            items = sections.get(sec, [])
+            for item in items:
+                if isinstance(item, dict) and item.get("id") == "cjkaufman.runescape":
+                    if item.get("showCharacterName") != show_character_name:
+                        item["showCharacterName"] = show_character_name
+                        modified = True
+        if modified:
+            tmp = shell_json.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, shell_json)
+    except Exception as e:
+        print(f"Error updating shell.json: {e}", file=sys.stderr)
+
 def safe_read_state():
+    default_show_name = read_shell_json_setting()
     if not STATE_FILE.exists():
         return {
             "running": False,
@@ -175,14 +216,17 @@ def safe_read_state():
             "alert": False,
             "alertMessage": "",
             "address": "",
-            "showCharacterName": True,
+            "showCharacterName": default_show_name,
             "lastDismissTime": 0,
             "lastNotifId": 0,
             "lastUpdated": int(time.time() * 1000)
         }
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            st = json.load(f)
+            if "showCharacterName" not in st:
+                st["showCharacterName"] = default_show_name
+            return st
     except Exception:
         return {}
 
@@ -609,7 +653,9 @@ def action_clear_alert():
 def action_set_config(data):
     state = safe_read_state()
     if "showCharacterName" in data:
-        state["showCharacterName"] = bool(data["showCharacterName"])
+        val = bool(data["showCharacterName"])
+        state["showCharacterName"] = val
+        update_shell_json_setting(val)
     safe_write_state(state)
     return {"ok": True, "showCharacterName": state.get("showCharacterName", True)}
 
