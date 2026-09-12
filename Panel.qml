@@ -248,7 +248,7 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    focusTarget: null
+    focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(380))
     contentHeight: panel.fittedContentHeight(menuCol.implicitHeight + Style.space(24), Style.space(520))
 
@@ -256,6 +256,7 @@ Panel {
       id: keyCatcher
       anchors.fill: parent
       onCloseRequested: root.close()
+      onTabRequested: function(direction) { root.switchPanel(direction) }
 
       Flickable {
         anchors.fill: parent

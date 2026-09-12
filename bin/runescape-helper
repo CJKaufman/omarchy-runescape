@@ -246,6 +246,49 @@ def get_active_special_workspace():
         pass
     return ""
 
+def get_monitor_geometry():
+    try:
+        out = run_hyprctl(["monitors", "-j"])
+        if out:
+            mons = json.loads(out)
+            for m in mons:
+                if m.get("focused"):
+                    scale = float(m.get("scale", 1.0))
+                    w = int(m.get("width", 1920) / scale)
+                    h = int(m.get("height", 1080) / scale)
+                    return w, h
+            if mons:
+                m = mons[0]
+                scale = float(m.get("scale", 1.0))
+                w = int(m.get("width", 1920) / scale)
+                h = int(m.get("height", 1080) / scale)
+                return w, h
+    except Exception:
+        pass
+    return 1280, 720
+
+def rescue_trapped_windows():
+    """
+    Safety invariant: scans special:runescape. If any non-RuneLite window
+    (such as zen browser or foot) is on special:runescape, moves it back
+    to workspace 1 immediately.
+    """
+    lua = """
+    for _, w in ipairs(hl.get_windows()) do
+      if w.workspace and w.workspace.name == "special:runescape" then
+        local cls = (w.class or ""):lower()
+        if not (cls:find("runelite") or cls:find("net-runelite")) then
+          hl.dispatch(hl.dsp.focus({ window = w }))
+          local act = hl.get_active_window()
+          if act and act.address == w.address then
+            hl.dispatch(hl.dsp.window.move({ workspace = "1", follow = false }))
+          end
+        end
+      end
+    end
+    """
+    run_hypr_eval(lua)
+
 def refocus_active_workspace():
     """
     Shifts focus to any window on the currently active normal workspace.
@@ -264,18 +307,33 @@ def refocus_active_workspace():
     """
     run_hypr_eval(lua)
 
-def ensure_runelite_geometry(w=POPUP_W, h=POPUP_H, x=POPUP_X, y=POPUP_Y):
+def ensure_runelite_geometry(w=POPUP_W, h=POPUP_H):
     """
-    Explicitly positions and resizes the RuneLite window directly under the
-    top bar at (POPUP_X, POPUP_Y) with size (POPUP_W, POPUP_H).
+    Positions and resizes RuneLite directly under the top bar.
+    STRICT SAFETY: Only moves the window if focus was verified to match
+    the RuneLite address. Never touches any other application window.
     """
+    client = get_runelite_client()
+    if not client:
+        return
+    addr = client.get("address", "")
+    if not addr:
+        return
+
+    mon_w, _ = get_monitor_geometry()
+    pos_x = max(0, mon_w - w - 16)
+    pos_y = POPUP_Y
+
     lua = f"""
+    local target_addr = "{addr}"
     for _, win in ipairs(hl.get_windows()) do
-      local cls = win.class:lower()
-      if cls:find("runelite") or cls:find("net-runelite") then
+      if win.address == target_addr then
         hl.dispatch(hl.dsp.focus({{ window = win }}))
-        hl.dispatch(hl.dsp.window.move({{ x = {x}, y = {y}, relative = false }}))
-        hl.dispatch(hl.dsp.window.resize({{ x = {w}, y = {h}, relative = false }}))
+        local act = hl.get_active_window()
+        if act and act.address == target_addr then
+          hl.dispatch(hl.dsp.window.move({{ x = {pos_x}, y = {pos_y}, relative = false }}))
+          hl.dispatch(hl.dsp.window.resize({{ x = {w}, y = {h}, relative = false }}))
+        end
         break
       end
     end
@@ -293,6 +351,7 @@ def ensure_jagex_launcher_hidden():
 
 def action_status():
     ensure_daemon_running()
+    rescue_trapped_windows()
     client = get_runelite_client()
     state = safe_read_state()
     jagex_running = is_jagex_launcher_running()
@@ -321,6 +380,7 @@ def action_status():
     return state
 
 def action_toggle():
+    rescue_trapped_windows()
     client = get_runelite_client()
     state = safe_read_state()
     if not client:
@@ -331,16 +391,12 @@ def action_toggle():
     now = time.time()
     last_dismiss = float(state.get("lastDismissTime", 0))
 
-    # If the window was dismissed within the last 400ms (e.g. from clicking the bar,
-    # which caused activewindow focus-loss right before this toggle handler fired),
-    # do NOT re-open it. The user's action was to close it.
     if not is_open and (now - last_dismiss) < 0.4:
         state["popupOpen"] = False
         state["lastUpdated"] = int(now * 1000)
         safe_write_state(state)
         return {"ok": True, "popupOpen": False}
 
-    # Close launcher scratchpad if visible
     if active_sw == "special:runescape_launcher":
         run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape_launcher")')
 
@@ -353,10 +409,14 @@ def action_toggle():
         state["alert"] = False
         state["alertMessage"] = ""
         state["openedAt"] = now
-        # Write state BEFORE dispatching to prevent any race condition in the daemon
+        state["hasGainedFocus"] = False
         safe_write_state(state)
         run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
         ensure_runelite_geometry()
+        # Explicitly focus RuneLite so player is ready immediately
+        addr = client.get("address", "")
+        if addr:
+            run_hypr_eval(f'hl.dispatch(hl.dsp.focus({{ window = "address:{addr}" }}))')
     else:
         state["lastDismissTime"] = now
         safe_write_state(state)
@@ -370,6 +430,7 @@ def action_dismiss():
     active_sw = get_active_special_workspace()
     now = time.time()
     state["popupOpen"] = False
+    state["hasGainedFocus"] = False
     state["lastDismissTime"] = now
     state["lastUpdated"] = int(now * 1000)
     safe_write_state(state)
@@ -379,12 +440,23 @@ def action_dismiss():
     return {"ok": True, "popupOpen": False}
 
 def action_detach(ws="5"):
+    client = get_runelite_client()
+    if not client:
+        return {"ok": False, "error": "RuneLite is not running"}
+    addr = client.get("address", "")
+    if not addr:
+        return {"ok": False, "error": "No RuneLite address"}
+
     lua_detach = f"""
+    local target_addr = "{addr}"
     for _, w in ipairs(hl.get_windows()) do
-      local cls = w.class:lower()
-      if cls:find("runelite") or cls:find("net-runelite") then
-        hl.dispatch(hl.dsp.window.move({{ window = w, workspace = "{ws}", follow = true }}))
-        hl.dispatch(hl.dsp.window.center({{ window = w }}))
+      if w.address == target_addr then
+        hl.dispatch(hl.dsp.focus({{ window = w }}))
+        local act = hl.get_active_window()
+        if act and act.address == target_addr then
+          hl.dispatch(hl.dsp.window.move({{ workspace = "{ws}", follow = true }}))
+          hl.dispatch(hl.dsp.window.center({{}}))
+        end
         break
       end
     end
@@ -393,7 +465,6 @@ def action_detach(ws="5"):
     active_sw = get_active_special_workspace()
     if active_sw == "special:runescape":
         run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
-    refocus_active_workspace()
     state = safe_read_state()
     state["popupOpen"] = False
     state["mode"] = "normal"
@@ -401,14 +472,28 @@ def action_detach(ws="5"):
     return {"ok": True, "mode": "normal", "workspace": ws}
 
 def action_dock():
+    client = get_runelite_client()
+    if not client:
+        return {"ok": False, "error": "RuneLite is not running"}
+    addr = client.get("address", "")
+    if not addr:
+        return {"ok": False, "error": "No RuneLite address"}
+
+    mon_w, _ = get_monitor_geometry()
+    pos_x = max(0, mon_w - POPUP_W - 16)
+    pos_y = POPUP_Y
+
     lua_dock = f"""
+    local target_addr = "{addr}"
     for _, w in ipairs(hl.get_windows()) do
-      local cls = w.class:lower()
-      if cls:find("runelite") or cls:find("net-runelite") then
-        hl.dispatch(hl.dsp.window.move({{ window = w, workspace = "special:runescape", follow = false }}))
+      if w.address == target_addr then
         hl.dispatch(hl.dsp.focus({{ window = w }}))
-        hl.dispatch(hl.dsp.window.move({{ x = {POPUP_X}, y = {POPUP_Y}, relative = false }}))
-        hl.dispatch(hl.dsp.window.resize({{ x = {POPUP_W}, y = {POPUP_H}, relative = false }}))
+        local act = hl.get_active_window()
+        if act and act.address == target_addr then
+          hl.dispatch(hl.dsp.window.move({{ workspace = "special:runescape", follow = false }}))
+          hl.dispatch(hl.dsp.window.move({{ x = {pos_x}, y = {pos_y}, relative = false }}))
+          hl.dispatch(hl.dsp.window.resize({{ x = {POPUP_W}, y = {POPUP_H}, relative = false }}))
+        end
         break
       end
     end
@@ -615,6 +700,7 @@ def run_daemon():
             # Periodic state sync & notification check (every 1 second)
             if now - last_poll > 1.0:
                 last_poll = now
+                rescue_trapped_windows()
                 state = safe_read_state()
                 has_alert, notif_msg, highest_id = check_notifications(state)
                 client = get_runelite_client()
@@ -645,6 +731,7 @@ def run_daemon():
                     if state.get("running"):
                         state["running"] = False
                         state["popupOpen"] = False
+                        state["hasGainedFocus"] = False
                         modified = True
 
                 # Keep popupOpen in sync with special:runescape visibility
@@ -654,6 +741,7 @@ def run_daemon():
                 opened_at_poll = float(state.get("openedAt", 0))
                 if state.get("popupOpen") and not is_sw_visible and (now_poll - opened_at_poll) >= 1.0:
                     state["popupOpen"] = False
+                    state["hasGainedFocus"] = False
                     modified = True
                 elif not state.get("popupOpen") and is_sw_visible:
                     state["popupOpen"] = True
@@ -692,26 +780,34 @@ def run_daemon():
                             now = time.time()
                             is_runelite = ("runelite" in active_cls or active_cls == "net-runelite-launcher-launcher")
 
-                            # User focused or clicked inside RuneLite: clear alert!
-                            if is_runelite and state.get("alert"):
-                                state["alert"] = False
-                                state["alertMessage"] = ""
-                                safe_write_state(state)
+                            # User focused or clicked inside RuneLite: clear alert and mark hasGainedFocus
+                            if is_runelite:
+                                modified = False
+                                if state.get("alert"):
+                                    state["alert"] = False
+                                    state["alertMessage"] = ""
+                                    modified = True
+                                if not state.get("hasGainedFocus"):
+                                    state["hasGainedFocus"] = True
+                                    modified = True
+                                if modified:
+                                    safe_write_state(state)
 
                             opened_at = float(state.get("openedAt", 0))
 
                             # Focus lost auto-dismiss:
-                            # Only trigger if:
+                            # CRITICAL SAFETY: Only auto-dismiss if:
                             # 1) popup is currently marked open
-                            # 2) not RuneLite
-                            # 3) active_cls is a non-empty window class (not bar or layer surface)
-                            # 4) grace period of 1.2s has elapsed since user opened the popup
-                            if state.get("popupOpen") and not is_runelite and active_cls != "" and (now - opened_at) >= 1.2:
+                            # 2) user previously actually focused/interacted with RuneLite (hasGainedFocus == True)
+                            # 3) active_cls is a real application window (not blank or desktop)
+                            # 4) grace period of 1.0s has elapsed
+                            if state.get("popupOpen") and state.get("hasGainedFocus") and not is_runelite and active_cls != "" and (now - opened_at) >= 1.0:
                                 active_sw = get_active_special_workspace()
                                 if active_sw == "special:runescape":
                                     run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
                                 refocus_active_workspace()
                                 state["popupOpen"] = False
+                                state["hasGainedFocus"] = False
                                 state["lastDismissTime"] = now
                                 state["lastUpdated"] = int(now * 1000)
                                 safe_write_state(state)

@@ -75,7 +75,7 @@ To ensure the game window floats perfectly under the bar on the `special:runesca
 
 ```lua
 -- RuneLite OSRS game client popup scratchpad
-o.window({ class = "^(net-runelite-launcher-Launcher)$" }, { float = true, size = { 840, 600 }, move = { 680, 34 }, workspace = "special:runescape" })
+o.window({ class = "^(net-runelite-launcher-Launcher)$" }, { float = true, size = { 840, 600 }, move = { "(monitor_w-window_w-16)", "34" }, workspace = "special:runescape" })
 
 -- Jagex Launcher login window
 o.window({ class = "^(jagex-launcher)$" }, { float = true, center = true, size = { 800, 600 } })
