@@ -9,250 +9,194 @@ import os
 import sys
 import json
 import time
+import stat
 import socket
 import select
-import shutil
 import subprocess
 from pathlib import Path
 
 MAX_STDIN_BYTES = 65536
+MAX_FILE_BYTES = 65536
+MAX_SOCKET_BUFFER = 65536
+MAX_SUBPROCESS_BYTES = 262144
+MAX_NOTIF_FILES_SCANNED = 50
+
+HYPRCTL_BIN = "/usr/bin/hyprctl"
+PGREP_BIN = "/usr/bin/pgrep"
+PKILL_BIN = "/usr/bin/pkill"
+NOTIFY_SEND_BIN = "/usr/bin/notify-send"
+PYTHON_BIN = "/usr/bin/python3"
+
 STATE_DIR = Path.home() / ".local/state/omarchy/cjkaufman.runescape"
 STATE_FILE = STATE_DIR / "state.json"
 PID_FILE = Path(f"/run/user/{os.getuid()}/runescape-helper.pid")
 NOTIF_DIR = Path.home() / ".local/state/omarchy/notifications"
-
-def send_desktop_notification(summary, body, urgency="normal"):
-    try:
-        subprocess.run(["notify-send", "-u", urgency, "-a", "RuneScape", summary, body], timeout=2)
-    except Exception:
-        pass
-
-def ensure_executable(path):
-    if not path:
-        return path
-    try:
-        p = Path(path)
-        if p.exists() and p.is_file():
-            if not os.access(str(p), os.X_OK):
-                current_mode = p.stat().st_mode
-                p.chmod(current_mode | 0o755)
-    except Exception as e:
-        print(f"Could not chmod +x {path}: {e}", file=sys.stderr)
-    return str(path)
-
-def check_for_windows_installer():
-    search_roots = [Path.home() / "Downloads", Path.home() / "Desktop"]
-    for root_dir in search_roots:
-        if not root_dir.exists():
-            continue
-        try:
-            for f in root_dir.rglob("*"):
-                if f.is_file() and "jagex" in f.name.lower() and f.name.lower().endswith(".exe"):
-                    return str(f)
-        except Exception:
-            pass
-    return None
-
-def find_jagex_launcher():
-    # 1. Standard candidate locations
-    candidates = [
-        shutil.which("jagex-launcher"),
-        shutil.which("jagexlauncher"),
-        Path.home() / ".local/bin/jagex-launcher",
-        Path.home() / ".local/share/Jagex Launcher/jagex-launcher",
-    ]
-    for c in candidates:
-        if c and Path(c).exists() and Path(c).is_file():
-            return ensure_executable(str(c))
-
-    # 2. Search common user directories (case-insensitive)
-    search_roots = [
-        Path.home() / "Downloads",
-        Path.home() / "Desktop",
-        Path.home() / "Applications",
-        Path.home() / "Games",
-        Path.home() / ".local/share/Jagex Launcher",
-    ]
-
-    found_appimages = []
-    found_executables = []
-
-    for root_dir in search_roots:
-        if not root_dir.exists():
-            continue
-        try:
-            for f in root_dir.rglob("*"):
-                if not f.is_file():
-                    continue
-                name_lower = f.name.lower()
-                if "jagex" in name_lower:
-                    if name_lower.endswith(".appimage"):
-                        found_appimages.append((f.stat().st_mtime, f))
-                    elif not name_lower.endswith((".exe", ".txt", ".png", ".jpg", ".zip", ".tar.gz", ".deb", ".rpm")):
-                        if os.access(str(f), os.X_OK):
-                            found_executables.append((f.stat().st_mtime, f))
-        except Exception:
-            pass
-
-    if found_appimages:
-        found_appimages.sort(key=lambda x: x[0], reverse=True)
-        return ensure_executable(str(found_appimages[0][1]))
-
-    if found_executables:
-        found_executables.sort(key=lambda x: x[0], reverse=True)
-        return ensure_executable(str(found_executables[0][1]))
-
-    return None
-
-def find_runelite():
-    candidates = [
-        shutil.which("runelite"),
-        shutil.which("RuneLite"),
-        Path.home() / ".local/share/Jagex Launcher/games/runelite/RuneLite.AppImage",
-        Path.home() / ".local/share/runelite/RuneLite.AppImage",
-        Path.home() / ".local/bin/RuneLite.AppImage",
-        Path("/var/lib/flatpak/exports/bin/net.runelite.RuneLite"),
-        Path.home() / ".local/share/flatpak/exports/bin/net.runelite.RuneLite",
-    ]
-    for c in candidates:
-        if c and Path(c).exists() and Path(c).is_file():
-            return ensure_executable(str(c))
-
-    search_roots = [
-        Path.home() / "Downloads",
-        Path.home() / "Desktop",
-        Path.home() / "Applications",
-        Path.home() / "Games",
-        Path.home() / ".local/share",
-    ]
-    for root_dir in search_roots:
-        if not root_dir.exists():
-            continue
-        try:
-            for f in root_dir.rglob("*"):
-                if not f.is_file():
-                    continue
-                name_lower = f.name.lower()
-                if "runelite" in name_lower and name_lower.endswith(".appimage"):
-                    return ensure_executable(str(f))
-        except Exception:
-            pass
-    return None
+SHELL_CONFIG_FILE = Path.home() / ".config/omarchy/shell.json"
 
 POPUP_W = 840
 POPUP_H = 600
 POPUP_X = 680
 POPUP_Y = 34
 
-def ensure_state_dir():
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    os.chmod(STATE_DIR, 0o700)
-
-def safe_write_state(state):
-    ensure_state_dir()
-    payload = json.dumps(state, indent=2).encode("utf-8")
-    tmp_file = STATE_DIR / f".state.tmp.{os.getpid()}"
+def is_trusted_executable(file_path):
+    """
+    Validates that a path:
+    1. Is not empty and exists.
+    2. Does not traverse untrusted symlinks.
+    3. Is owned by root (uid 0) or the current user (uid os.getuid()).
+    4. Is not world-writable (mode & 0o002 == 0).
+    5. Is a regular file.
+    6. Is executable.
+    """
+    if not file_path:
+        return False
     try:
-        fd = os.open(str(tmp_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(str(tmp_file), str(STATE_FILE))
-    except Exception as e:
-        if tmp_file.exists():
-            tmp_file.unlink(missing_ok=True)
-        print(f"Failed to write state: {e}", file=sys.stderr)
+        raw_path = os.path.abspath(str(file_path))
+        st_raw = os.lstat(raw_path)
 
-def read_shell_json_setting():
-    shell_json = Path.home() / ".config/omarchy/shell.json"
-    if shell_json.exists():
-        try:
-            with open(shell_json, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            sections = data.get("bar", {}).get("layout", {})
-            for sec in ["left", "center", "right"]:
-                for item in sections.get(sec, []):
-                    if isinstance(item, dict) and item.get("id") == "cjkaufman.runescape":
-                        if "showCharacterName" in item:
-                            return bool(item["showCharacterName"])
-        except Exception:
-            pass
-    return True
+        parent_dir = os.path.dirname(raw_path)
+        if os.path.exists(parent_dir):
+            st_parent = os.stat(parent_dir)
+            if st_parent.st_mode & 0o002 != 0:
+                return False
 
-def update_shell_json_setting(show_character_name):
-    shell_json = Path.home() / ".config/omarchy/shell.json"
-    if not shell_json.exists():
-        return
-    try:
-        with open(shell_json, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        modified = False
-        sections = data.get("bar", {}).get("layout", {})
-        for sec in ["left", "center", "right"]:
-            items = sections.get(sec, [])
-            for item in items:
-                if isinstance(item, dict) and item.get("id") == "cjkaufman.runescape":
-                    if item.get("showCharacterName") != show_character_name:
-                        item["showCharacterName"] = show_character_name
-                        modified = True
-        if modified:
-            tmp = shell_json.with_suffix(".tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-            os.replace(tmp, shell_json)
-    except Exception as e:
-        print(f"Error updating shell.json: {e}", file=sys.stderr)
-
-def safe_read_state():
-    default_show_name = read_shell_json_setting()
-    if not STATE_FILE.exists():
-        return {
-            "running": False,
-            "launcherRunning": False,
-            "character": "",
-            "popupOpen": False,
-            "mode": "popup",
-            "alert": False,
-            "alertMessage": "",
-            "address": "",
-            "showCharacterName": default_show_name,
-            "lastDismissTime": 0,
-            "lastNotifId": 0,
-            "lastUpdated": int(time.time() * 1000)
-        }
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            st = json.load(f)
-            if "showCharacterName" not in st:
-                st["showCharacterName"] = default_show_name
-            return st
+        if stat.S_ISLNK(st_raw.st_mode):
+            if st_raw.st_uid not in (0, os.getuid()):
+                return False
+            real_path = os.path.realpath(raw_path)
+            st_real = os.stat(real_path)
+            if not stat.S_ISREG(st_real.st_mode):
+                return False
+            if st_real.st_uid not in (0, os.getuid()):
+                return False
+            if st_real.st_mode & 0o002 != 0:
+                return False
+            if not os.access(real_path, os.X_OK):
+                return False
+            return True
+        else:
+            if not stat.S_ISREG(st_raw.st_mode):
+                return False
+            if st_raw.st_uid not in (0, os.getuid()):
+                return False
+            if st_raw.st_mode & 0o002 != 0:
+                return False
+            if not os.access(raw_path, os.X_OK):
+                return False
+            return True
     except Exception:
-        return {}
+        return False
+
+def get_trusted_tool(name, default_path):
+    candidates = [default_path, f"/bin/{name}", f"/usr/local/bin/{name}"]
+    for cand in candidates:
+        if is_trusted_executable(cand):
+            return cand
+    return None
+
+def get_hyprctl():
+    return get_trusted_tool("hyprctl", HYPRCTL_BIN)
+
+def get_pgrep():
+    return get_trusted_tool("pgrep", PGREP_BIN)
+
+def get_pkill():
+    return get_trusted_tool("pkill", PKILL_BIN)
+
+def get_notify_send():
+    return get_trusted_tool("notify-send", NOTIFY_SEND_BIN)
+
+def run_cmd_bounded(cmd, timeout=3.0, max_bytes=MAX_SUBPROCESS_BYTES):
+    """
+    Executes command with strict timeout and output ceiling.
+    Kills and reaps child process if limits are exceeded.
+    """
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            close_fds=True
+        )
+        out_chunks = []
+        bytes_read = 0
+        deadline = time.time() + timeout
+
+        os.set_blocking(proc.stdout.fileno(), False)
+
+        while time.time() < deadline:
+            ret = proc.poll()
+            r, _, _ = select.select([proc.stdout], [], [], 0.2)
+            if r:
+                chunk = proc.stdout.read(4096)
+                if not chunk:
+                    break
+                out_chunks.append(chunk)
+                bytes_read += len(chunk)
+                if bytes_read >= max_bytes:
+                    proc.kill()
+                    proc.wait()
+                    break
+            elif ret is not None:
+                break
+        else:
+            proc.kill()
+            proc.wait()
+            return ""
+
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+        return b"".join(out_chunks)[:max_bytes].decode("utf-8", errors="ignore").strip()
+    except Exception:
+        if proc:
+            try:
+                proc.kill()
+                proc.wait()
+            except Exception:
+                pass
+        return ""
 
 def run_hyprctl(args):
-    try:
-        res = subprocess.run(["hyprctl"] + args, capture_output=True, text=True, timeout=3)
-        return res.stdout.strip()
-    except Exception as e:
-        print(f"hyprctl error: {e}", file=sys.stderr)
+    bin_path = get_hyprctl()
+    if not bin_path:
         return ""
+    return run_cmd_bounded([bin_path] + args, timeout=3.0)
 
 def run_hypr_eval(lua_code):
-    try:
-        res = subprocess.run(["hyprctl", "eval", lua_code], capture_output=True, text=True, timeout=3)
-        return res.stdout.strip()
-    except Exception as e:
-        print(f"hyprctl eval error: {e}", file=sys.stderr)
+    bin_path = get_hyprctl()
+    if not bin_path:
         return ""
+    return run_cmd_bounded([bin_path, "eval", lua_code], timeout=3.0)
 
 def run_hypr_dispatch(lua_dsp):
-    try:
-        res = subprocess.run(["hyprctl", "dispatch", lua_dsp], capture_output=True, text=True, timeout=3)
-        return res.stdout.strip()
-    except Exception as e:
-        print(f"hyprctl dispatch error: {e}", file=sys.stderr)
+    bin_path = get_hyprctl()
+    if not bin_path:
         return ""
+    return run_cmd_bounded([bin_path, "dispatch", lua_dsp], timeout=3.0)
+
+def send_desktop_notification(summary, body, urgency="normal"):
+    bin_path = get_notify_send()
+    if not bin_path:
+        return
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [bin_path, "-u", urgency, "-a", "RuneScape", str(summary)[:128], str(body)[:256]],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True
+        )
+        proc.wait(timeout=2.0)
+    except Exception:
+        if proc:
+            try:
+                proc.kill()
+                proc.wait()
+            except Exception:
+                pass
 
 def get_runelite_client():
     out = run_hyprctl(["clients", "-j"])
@@ -269,10 +213,26 @@ def get_runelite_client():
     return None
 
 def is_jagex_launcher_running():
+    bin_path = get_pgrep()
+    if not bin_path:
+        return False
+    proc = None
     try:
-        res = subprocess.run(["pgrep", "-f", "jagex-launcher"], capture_output=True, text=True)
-        return res.returncode == 0
+        proc = subprocess.Popen(
+            [bin_path, "-f", "jagex-launcher"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True
+        )
+        proc.wait(timeout=2.0)
+        return proc.returncode == 0
     except Exception:
+        if proc:
+            try:
+                proc.kill()
+                proc.wait()
+            except Exception:
+                pass
         return False
 
 def get_active_special_workspace():
@@ -394,6 +354,255 @@ def ensure_jagex_launcher_hidden():
     if active_sw == "special:runescape_launcher":
         run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape_launcher")')
 
+def ensure_state_dir():
+    current = Path.home()
+    for part in [".local", "state", "omarchy", "cjkaufman.runescape"]:
+        current = current / part
+        c_str = str(current)
+        if os.path.islink(c_str):
+            os.unlink(c_str)
+        if not os.path.exists(c_str):
+            os.mkdir(c_str, 0o700)
+        st = os.lstat(c_str)
+        if stat.S_ISLNK(st.st_mode):
+            raise PermissionError(f"Symlink detected at {c_str}")
+        if st.st_uid != os.getuid():
+            raise PermissionError(f"Directory not owned by current user: {c_str}")
+        if current == STATE_DIR:
+            os.chmod(c_str, 0o700)
+
+def safe_write_state(state):
+    ensure_state_dir()
+    payload = json.dumps(state, indent=2).encode("utf-8")
+    if len(payload) > MAX_FILE_BYTES:
+        raise ValueError("State payload exceeds maximum byte limit")
+    tmp_path = str(STATE_DIR / f".state.tmp.{os.getpid()}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(tmp_path, flags, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, str(STATE_FILE))
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+        print(f"Failed to write state: {e}", file=sys.stderr)
+
+def read_daemon_pid():
+    pid_str = str(PID_FILE)
+    if not os.path.exists(pid_str):
+        return None
+    try:
+        st = os.lstat(pid_str)
+        if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid():
+            remove_daemon_pid()
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(pid_str, flags)
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            raw = f.read(32).strip()
+        if raw.isdigit():
+            return int(raw)
+    except Exception:
+        pass
+    return None
+
+def write_daemon_pid():
+    pid_str = str(PID_FILE)
+    if os.path.lexists(pid_str):
+        remove_daemon_pid()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(pid_str, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+        f.flush()
+        os.fsync(f.fileno())
+
+def remove_daemon_pid():
+    pid_str = str(PID_FILE)
+    try:
+        if os.path.lexists(pid_str):
+            st = os.lstat(pid_str)
+            if not stat.S_ISLNK(st.st_mode) and st.st_uid == os.getuid():
+                os.unlink(pid_str)
+            elif stat.S_ISLNK(st.st_mode):
+                os.unlink(pid_str)
+    except Exception:
+        pass
+
+def get_custom_binary_setting(key):
+    try:
+        cfg_str = str(SHELL_CONFIG_FILE)
+        if not os.path.exists(cfg_str):
+            return None
+        st = os.lstat(cfg_str)
+        if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid():
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(cfg_str, flags)
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            raw = f.read(MAX_FILE_BYTES)
+        data = json.loads(raw)
+        sections = data.get("bar", {}).get("layout", {})
+        for sec in ["left", "center", "right"]:
+            for item in sections.get(sec, []):
+                if isinstance(item, dict) and item.get("id") == "cjkaufman.runescape":
+                    val = item.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+    except Exception:
+        pass
+    return None
+
+def find_jagex_launcher():
+    custom = get_custom_binary_setting("customLauncherPath")
+    if custom and is_trusted_executable(custom):
+        return custom
+
+    candidates = [
+        "/usr/bin/jagex-launcher",
+        "/usr/local/bin/jagex-launcher",
+        str(Path.home() / ".local/bin/jagex-launcher"),
+        str(Path.home() / ".local/bin/jagex-launcher.AppImage"),
+        str(Path.home() / ".local/bin/jagex-launcher-beta-linux-x86_64.AppImage"),
+        str(Path.home() / ".local/share/Jagex Launcher/jagex-launcher"),
+        str(Path.home() / ".local/share/Jagex Launcher/jagex-launcher.AppImage"),
+        "/var/lib/flatpak/exports/bin/com.jagex.Launcher",
+        str(Path.home() / ".local/share/flatpak/exports/bin/com.jagex.Launcher"),
+    ]
+    for c in candidates:
+        if is_trusted_executable(c):
+            return c
+    return None
+
+def find_runelite():
+    custom = get_custom_binary_setting("customRuneLitePath")
+    if custom and is_trusted_executable(custom):
+        return custom
+
+    candidates = [
+        "/usr/bin/runelite",
+        "/usr/bin/RuneLite",
+        "/usr/local/bin/runelite",
+        "/usr/local/bin/RuneLite",
+        "/var/lib/flatpak/exports/bin/net.runelite.RuneLite",
+        str(Path.home() / ".local/share/flatpak/exports/bin/net.runelite.RuneLite"),
+        str(Path.home() / ".local/bin/runelite"),
+        str(Path.home() / ".local/bin/RuneLite"),
+        str(Path.home() / ".local/bin/RuneLite.AppImage"),
+        str(Path.home() / ".local/share/runelite/RuneLite.AppImage"),
+        str(Path.home() / ".local/share/Jagex Launcher/games/runelite/RuneLite.AppImage"),
+    ]
+    for c in candidates:
+        if is_trusted_executable(c):
+            return c
+    return None
+
+def read_shell_json_setting():
+    cfg_str = str(SHELL_CONFIG_FILE)
+    if not os.path.exists(cfg_str):
+        return True
+    try:
+        st = os.lstat(cfg_str)
+        if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid():
+            return True
+        if st.st_size > MAX_FILE_BYTES:
+            return True
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(cfg_str, flags)
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            raw = f.read(MAX_FILE_BYTES)
+        data = json.loads(raw)
+        sections = data.get("bar", {}).get("layout", {})
+        for sec in ["left", "center", "right"]:
+            for item in sections.get(sec, []):
+                if isinstance(item, dict) and item.get("id") == "cjkaufman.runescape":
+                    if "showCharacterName" in item:
+                        return bool(item["showCharacterName"])
+    except Exception:
+        pass
+    return True
+
+def update_shell_json_setting(show_character_name):
+    cfg_str = str(SHELL_CONFIG_FILE)
+    if not os.path.exists(cfg_str):
+        return
+    try:
+        st = os.lstat(cfg_str)
+        if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid():
+            return
+        if st.st_size > MAX_FILE_BYTES:
+            return
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(cfg_str, flags)
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            raw = f.read(MAX_FILE_BYTES)
+        data = json.loads(raw)
+        modified = False
+        sections = data.get("bar", {}).get("layout", {})
+        for sec in ["left", "center", "right"]:
+            for item in sections.get(sec, []):
+                if isinstance(item, dict) and item.get("id") == "cjkaufman.runescape":
+                    if item.get("showCharacterName") != show_character_name:
+                        item["showCharacterName"] = show_character_name
+                        modified = True
+        if modified:
+            parent_dir = os.path.dirname(cfg_str)
+            tmp_path = os.path.join(parent_dir, f".shell.json.tmp.{os.getpid()}")
+            w_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+            payload = json.dumps(data, indent=2).encode("utf-8")
+            w_fd = os.open(tmp_path, w_flags, 0o600)
+            with os.fdopen(w_fd, "wb") as w_f:
+                w_f.write(payload)
+                w_f.flush()
+                os.fsync(w_f.fileno())
+            os.replace(tmp_path, cfg_str)
+    except Exception as e:
+        print(f"Error updating shell.json: {e}", file=sys.stderr)
+
+def safe_read_state():
+    default_show_name = read_shell_json_setting()
+    default_state = {
+        "running": False,
+        "launcherRunning": False,
+        "character": "",
+        "popupOpen": False,
+        "mode": "popup",
+        "alert": False,
+        "alertMessage": "",
+        "address": "",
+        "showCharacterName": default_show_name,
+        "lastDismissTime": 0,
+        "lastNotifTime": 0,
+        "lastUpdated": int(time.time() * 1000)
+    }
+    state_str = str(STATE_FILE)
+    if not os.path.exists(state_str):
+        return default_state
+    try:
+        st = os.lstat(state_str)
+        if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid():
+            return default_state
+        if st.st_size > MAX_FILE_BYTES:
+            return default_state
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(state_str, flags)
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            raw = f.read(MAX_FILE_BYTES)
+        st_data = json.loads(raw)
+        if isinstance(st_data, dict):
+            if "showCharacterName" not in st_data:
+                st_data["showCharacterName"] = default_show_name
+            return st_data
+    except Exception:
+        pass
+    return default_state
+
 def action_status():
     ensure_daemon_running()
     rescue_trapped_windows()
@@ -458,7 +667,6 @@ def action_toggle():
         safe_write_state(state)
         run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
         ensure_runelite_geometry()
-        # Explicitly focus RuneLite so player is ready immediately
         addr = client.get("address", "")
         if addr:
             run_hypr_eval(f'hl.dispatch(hl.dsp.focus({{ window = "address:{addr}" }}))')
@@ -550,21 +758,29 @@ def action_dock():
     return {"ok": True, "mode": "popup"}
 
 def action_toggle_launcher():
-    """
-    Toggles visibility of Jagex Launcher (in special:runescape_launcher).
-    """
     run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape_launcher")')
     return {"ok": True}
 
 def action_quit():
-    """
-    Terminates both RuneLite and Jagex Launcher cleanly when requested.
-    """
-    try:
-        subprocess.run(["pkill", "-f", "RuneLite"], capture_output=True)
-        subprocess.run(["pkill", "-f", "jagex-launcher"], capture_output=True)
-    except Exception:
-        pass
+    bin_path = get_pkill()
+    if bin_path:
+        for target in ["RuneLite", "jagex-launcher"]:
+            proc = None
+            try:
+                proc = subprocess.Popen(
+                    [bin_path, "-f", target],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True
+                )
+                proc.wait(timeout=2.0)
+            except Exception:
+                if proc:
+                    try:
+                        proc.kill()
+                        proc.wait()
+                    except Exception:
+                        pass
     state = safe_read_state()
     state["running"] = False
     state["launcherRunning"] = False
@@ -574,13 +790,20 @@ def action_quit():
     return {"ok": True}
 
 def launch_binary(target_app, env):
+    if not is_trusted_executable(target_app):
+        raise PermissionError(f"Untrusted executable path: {target_app}")
+
     ensure_state_dir()
     log_file = STATE_DIR / "launcher.log"
-    ensure_executable(target_app)
+    log_str = str(log_file)
+
+    if os.path.islink(log_str):
+        os.unlink(log_str)
 
     has_fuse2 = False
     for lib_dir in ["/usr/lib", "/usr/lib64", "/lib", "/lib64"]:
-        if Path(f"{lib_dir}/libfuse.so.2").exists():
+        fuse_path = f"{lib_dir}/libfuse.so.2"
+        if os.path.exists(fuse_path):
             has_fuse2 = True
             break
 
@@ -588,7 +811,13 @@ def launch_binary(target_app, env):
     if not has_fuse2 and target_app.lower().endswith(".appimage"):
         cmd.append("--appimage-extract-and-run")
 
-    with open(log_file, "a", encoding="utf-8") as out:
+    log_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    log_fd = os.open(log_str, log_flags, 0o600)
+
+    if os.fstat(log_fd).st_size > 1048576:
+        os.ftruncate(log_fd, 0)
+
+    with os.fdopen(log_fd, "a", encoding="utf-8") as out:
         out.write(f"\n--- Launching {target_app} at {time.ctime()} ---\n")
         out.write(f"Command: {' '.join(cmd)}\n")
         out.flush()
@@ -597,7 +826,8 @@ def launch_binary(target_app, env):
             env=env,
             start_new_session=True,
             stdout=out,
-            stderr=subprocess.STDOUT
+            stderr=subprocess.STDOUT,
+            close_fds=True
         )
         return proc
 
@@ -608,11 +838,7 @@ def action_launch():
 
     target_app = find_jagex_launcher() or find_runelite()
     if not target_app:
-        win_installer = check_for_windows_installer()
-        if win_installer:
-            err = f"Found Windows installer ({Path(win_installer).name}) in Downloads, but Linux requires the Linux AppImage from Jagex."
-        else:
-            err = "Neither Jagex Launcher nor RuneLite AppImage was found in ~/Downloads or PATH."
+        err = "Neither Jagex Launcher nor RuneLite binary was found in trusted paths."
         send_desktop_notification("RuneScape Launch Error", err, urgency="critical")
         return {"ok": False, "error": err}
     try:
@@ -633,7 +859,7 @@ def action_launch_runelite_direct():
 
     target_app = find_runelite()
     if not target_app:
-        err = "RuneLite AppImage or binary was not found in ~/Downloads or PATH."
+        err = "RuneLite binary was not found in trusted paths."
         send_desktop_notification("RuneScape Launch Error", err, urgency="critical")
         return {"ok": False, "error": err}
     try:
@@ -665,20 +891,53 @@ def check_notifications(state):
     last_ts = int(state.get("lastNotifTime", 0))
     highest_ts = last_ts
     alert_msg = None
+    files_scanned = 0
 
     for d in notif_dirs:
-        if not d.exists():
+        d_str = str(d)
+        if not os.path.exists(d_str):
             continue
-        for f in d.glob("*.json"):
+        try:
+            d_st = os.lstat(d_str)
+            if stat.S_ISLNK(d_st.st_mode) or d_st.st_uid != os.getuid():
+                continue
+        except Exception:
+            continue
+
+        entries = []
+        try:
+            with os.scandir(d_str) as it:
+                for entry in it:
+                    if files_scanned >= MAX_NOTIF_FILES_SCANNED:
+                        break
+                    try:
+                        if entry.name.endswith(".json") and entry.is_file(follow_symlinks=False):
+                            entries.append(entry.path)
+                            files_scanned += 1
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+
+        for file_path in entries:
             try:
-                fname = f.name
-                if "-" in fname and fname.endswith(".json"):
+                st = os.lstat(file_path)
+                if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid():
+                    continue
+                if st.st_size > MAX_FILE_BYTES:
+                    continue
+
+                fname = os.path.basename(file_path)
+                if "-" in fname:
                     ts_part = fname.split("-", 1)[0]
                     if ts_part.isdigit() and int(ts_part) <= last_ts:
                         continue
 
-                with open(f, "r", encoding="utf-8") as nf:
-                    data = json.load(nf)
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+                fd = os.open(file_path, flags)
+                with os.fdopen(fd, "r", encoding="utf-8") as nf:
+                    raw_data = nf.read(MAX_FILE_BYTES)
+                data = json.loads(raw_data)
                 ts = int(data.get("timestamp", 0))
                 if ts <= last_ts:
                     continue
@@ -688,10 +947,10 @@ def check_notifications(state):
                 body = str(data.get("body", "")).lower()
                 text = f"{app} {summary} {body}"
 
-                if "runelite" in app or "runescape" in app or "mining" in text or "idle" in text or "woodcutting" in text or "fishing" in text or "combat" in text or "afk" in text:
+                if any(k in text for k in ["runelite", "runescape", "mining", "idle", "woodcutting", "fishing", "combat", "afk"]):
                     if ts > highest_ts:
                         highest_ts = ts
-                        alert_msg = data.get("body") or data.get("summary") or "AFK / Idle Alert"
+                        alert_msg = str(data.get("body") or data.get("summary") or "AFK / Idle Alert")[:128]
             except Exception:
                 continue
 
@@ -699,18 +958,34 @@ def check_notifications(state):
         return True, alert_msg, highest_ts
     return False, "", highest_ts
 
+def is_safe_socket(path_str):
+    try:
+        st = os.lstat(path_str)
+        if stat.S_ISLNK(st.st_mode):
+            return False
+        if not stat.S_ISSOCK(st.st_mode):
+            return False
+        if st.st_uid != os.getuid():
+            return False
+        return True
+    except Exception:
+        return False
+
 def run_daemon():
-    # Enforce singleton
-    if PID_FILE.exists():
+    old_pid = read_daemon_pid()
+    if old_pid is not None:
         try:
-            old_pid = int(PID_FILE.read_text().strip())
             os.kill(old_pid, 0)
             print(f"Daemon already running with PID {old_pid}")
             return
         except (ProcessLookupError, ValueError):
-            PID_FILE.unlink(missing_ok=True)
+            remove_daemon_pid()
 
-    PID_FILE.write_text(str(os.getpid()))
+    try:
+        write_daemon_pid()
+    except Exception as e:
+        print(f"Failed to acquire daemon PID file: {e}", file=sys.stderr)
+        return
 
     xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
@@ -721,7 +996,6 @@ def run_daemon():
     last_poll = 0
     buffer = ""
 
-    # Initialize notification baseline so we don't alert on old history
     init_state = safe_read_state()
     if init_state.get("lastNotifTime", 0) == 0:
         init_state["lastNotifTime"] = int(time.time() * 1000)
@@ -733,18 +1007,16 @@ def run_daemon():
         while True:
             now = time.time()
 
-            # Connect socket2 if needed
             if not sock and (now - last_reconnect) > 2:
                 last_reconnect = now
                 try:
-                    if Path(sock_path).exists():
+                    if is_safe_socket(sock_path):
                         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                         sock.connect(sock_path)
                         sock.setblocking(False)
                 except Exception:
                     sock = None
 
-            # Periodic state sync & notification check (every 1 second)
             if now - last_poll > 1.0:
                 last_poll = now
                 rescue_trapped_windows()
@@ -781,7 +1053,6 @@ def run_daemon():
                         state["hasGainedFocus"] = False
                         modified = True
 
-                # Keep popupOpen in sync with special:runescape visibility
                 active_sw_poll = get_active_special_workspace()
                 is_sw_visible = (active_sw_poll == "special:runescape")
                 now_poll = time.time()
@@ -791,14 +1062,12 @@ def run_daemon():
                     state["hasGainedFocus"] = False
                     modified = True
                 elif not state.get("popupOpen") and is_sw_visible and (now_poll - opened_at_poll) >= 1.0:
-                    # Rogue visibility: immediately hide it and refocus
                     run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
                     refocus_active_workspace()
 
                 if modified:
                     safe_write_state(state)
 
-            # Read socket events
             readable = []
             if sock:
                 readable, _, _ = select.select([sock], [], [], 1.0)
@@ -813,13 +1082,15 @@ def run_daemon():
                         sock = None
                         continue
                     buffer += data
+                    if len(buffer) > MAX_SOCKET_BUFFER:
+                        buffer = buffer[-MAX_SOCKET_BUFFER:]
+
                     while "\n" in buffer:
                         line, buffer = buffer.split("\n", 1)
                         line = line.strip()
                         if not line:
                             continue
 
-                        # Handle activewindow: auto-hide popup when clicking outside, or clear alert if RuneLite focused
                         if line.startswith("activewindow>>"):
                             payload = line[len("activewindow>>"):]
                             parts = payload.split(",", 1)
@@ -829,12 +1100,7 @@ def run_daemon():
                             is_runelite = ("runelite" in active_cls or active_cls == "net-runelite-launcher-launcher")
                             opened_at = float(state.get("openedAt", 0))
 
-                            # User focused or clicked inside RuneLite
                             if is_runelite:
-                                # Rogue focus guard: if popup was NOT requested open,
-                                # an unmapped overlay (like Google Tasks or Logitech closing)
-                                # gave focus to RuneLite in Hyprland's focus stack.
-                                # Immediately tuck it back into the special workspace!
                                 if not state.get("popupOpen") and (now - opened_at) >= 1.0:
                                     active_sw = get_active_special_workspace()
                                     if active_sw == "special:runescape":
@@ -852,12 +1118,6 @@ def run_daemon():
                                     if modified:
                                         safe_write_state(state)
 
-                            # Focus lost auto-dismiss:
-                            # CRITICAL SAFETY: Only auto-dismiss if:
-                            # 1) popup is currently marked open
-                            # 2) user previously actually focused/interacted with RuneLite (hasGainedFocus == True)
-                            # 3) active_cls is a real application window (not blank or desktop)
-                            # 4) grace period of 1.0s has elapsed
                             if state.get("popupOpen") and state.get("hasGainedFocus") and not is_runelite and active_cls != "" and (now - opened_at) >= 1.0:
                                 active_sw = get_active_special_workspace()
                                 if active_sw == "special:runescape":
@@ -869,7 +1129,6 @@ def run_daemon():
                                 state["lastUpdated"] = int(now * 1000)
                                 safe_write_state(state)
 
-                        # Handle workspace change: dismiss popup if switching workspace
                         elif line.startswith("workspace>>"):
                             state = safe_read_state()
                             now = time.time()
@@ -884,7 +1143,6 @@ def run_daemon():
                                 state["lastUpdated"] = int(now * 1000)
                                 safe_write_state(state)
 
-                        # Handle openwindow: when RuneLite opens, position it and hide Jagex Launcher
                         elif line.startswith("openwindow>>"):
                             payload = line[len("openwindow>>"):]
                             parts = payload.split(",", 3)
@@ -894,7 +1152,6 @@ def run_daemon():
                                     ensure_jagex_launcher_hidden()
                                     ensure_runelite_geometry()
 
-                        # Handle urgency hint: flash icon
                         elif line.startswith("urgent>>"):
                             addr = line[len("urgent>>"):].strip().lower().replace("0x", "")
                             state = safe_read_state()
@@ -906,7 +1163,6 @@ def run_daemon():
                                     state["alertMessage"] = "AFK / Idle Alert"
                                     safe_write_state(state)
 
-                        # Handle client close
                         elif line.startswith("closewindow>>"):
                             addr = line[len("closewindow>>"):].strip()
                             state = safe_read_state()
@@ -914,26 +1170,37 @@ def run_daemon():
                                 state["running"] = False
                                 state["popupOpen"] = False
                                 safe_write_state(state)
-                except Exception as e:
+                except Exception:
                     if sock:
                         sock.close()
                     sock = None
 
     finally:
-        PID_FILE.unlink(missing_ok=True)
+        remove_daemon_pid()
 
 def ensure_daemon_running():
-    if PID_FILE.exists():
+    old_pid = read_daemon_pid()
+    if old_pid is not None:
         try:
-            pid = int(PID_FILE.read_text().strip())
-            os.kill(pid, 0)
+            os.kill(old_pid, 0)
             return
-        except (ProcessLookupError, ValueError):
-            PID_FILE.unlink(missing_ok=True)
+        except ProcessLookupError:
+            remove_daemon_pid()
 
-    # Spawn daemon
     script_path = os.path.abspath(__file__)
-    subprocess.Popen([sys.executable, script_path, "daemon"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not is_trusted_executable(script_path):
+        return
+    py_bin = PYTHON_BIN if is_trusted_executable(PYTHON_BIN) else sys.executable
+    if not is_trusted_executable(py_bin):
+        return
+
+    subprocess.Popen(
+        [py_bin, script_path, "daemon"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True
+    )
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "daemon":
