@@ -219,7 +219,7 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     dimmed: root.alert ? !root.flashPhase : false
-    active: root.alert ? root.flashPhase : root.popupOpen
+    active: root.alert ? root.flashPhase : (root.mode === "popup" && root.popupOpen)
     activeColor: root.alert ? root.urgent : root.accent
     useActiveColor: true
     labelVisible: true
@@ -240,10 +240,13 @@ Panel {
 
     tooltipText: {
       if (root.alert) {
-        return "⚠️ RuneScape Alert: " + (root.alertMessage || "Idle / Stopped mining!") + " (Click to open)"
+        return "⚠️ RuneScape Alert: " + (root.alertMessage || "Idle / Stopped mining!") + " (Click to focus)"
       }
       if (root.running) {
         var charStr = root.character ? (" (" + root.character + ")") : ""
+        if (root.mode === "normal") {
+          return "RuneScape: Active" + charStr + " (Normal Mode) · Left-click: Focus · Right-click: Menu"
+        }
         return "RuneScape: Active" + charStr + " · Left-click: Toggle Quick-Screen · Right-click: Menu"
       }
       return "RuneScape / RuneLite: Offline (Click to launch & login)"
@@ -262,10 +265,14 @@ Panel {
               root.togglePopup()
             }
           } else {
-            if (root.popupOpen) {
-              root.dismissPopup()
-            } else {
+            if (root.mode === "normal") {
               root.togglePopup()
+            } else {
+              if (root.popupOpen) {
+                root.dismissPopup()
+              } else {
+                root.togglePopup()
+              }
             }
           }
         }

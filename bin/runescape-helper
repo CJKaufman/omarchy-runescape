@@ -13,6 +13,7 @@ import stat
 import socket
 import select
 import subprocess
+import fcntl
 from pathlib import Path
 
 MAX_STDIN_BYTES = 65536
@@ -30,8 +31,11 @@ PYTHON_BIN = "/usr/bin/python3"
 STATE_DIR = Path.home() / ".local/state/omarchy/cjkaufman.runescape"
 STATE_FILE = STATE_DIR / "state.json"
 PID_FILE = Path(f"/run/user/{os.getuid()}/runescape-helper.pid")
+LOCK_FILE = Path(f"/run/user/{os.getuid()}/runescape-helper.lock")
 NOTIF_DIR = Path.home() / ".local/state/omarchy/notifications"
 SHELL_CONFIG_FILE = Path.home() / ".config/omarchy/shell.json"
+
+DAEMON_LOCK_FD = None
 
 POPUP_W = 840
 POPUP_H = 600
@@ -212,6 +216,14 @@ def get_runelite_client():
         pass
     return None
 
+def is_runelite_in_scratchpad(client=None):
+    if not client:
+        client = get_runelite_client()
+    if not client:
+        return False
+    ws_name = client.get("workspace", {}).get("name", "")
+    return "special:runescape" in ws_name
+
 def is_jagex_launcher_running():
     bin_path = get_pgrep()
     if not bin_path:
@@ -316,10 +328,13 @@ def ensure_runelite_geometry(w=POPUP_W, h=POPUP_H):
     """
     Positions and resizes RuneLite directly under the top bar.
     STRICT SAFETY: Only moves the window if focus was verified to match
-    the RuneLite address. Never touches any other application window.
+    the RuneLite address AND RuneLite is in special:runescape. Never touches
+    any other application window or normal tiled game client.
     """
     client = get_runelite_client()
     if not client:
+        return
+    if not is_runelite_in_scratchpad(client):
         return
     addr = client.get("address", "")
     if not addr:
@@ -432,6 +447,36 @@ def remove_daemon_pid():
                 os.unlink(pid_str)
             elif stat.S_ISLNK(st.st_mode):
                 os.unlink(pid_str)
+    except Exception:
+        pass
+
+def acquire_daemon_lock():
+    global DAEMON_LOCK_FD
+    lock_str = str(LOCK_FILE)
+    try:
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(lock_str, flags, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        DAEMON_LOCK_FD = fd
+        return True
+    except (BlockingIOError, OSError):
+        return False
+
+def remove_daemon_lock():
+    global DAEMON_LOCK_FD
+    if DAEMON_LOCK_FD is not None:
+        try:
+            fcntl.flock(DAEMON_LOCK_FD, fcntl.LOCK_UN)
+            os.close(DAEMON_LOCK_FD)
+        except Exception:
+            pass
+        DAEMON_LOCK_FD = None
+    lock_str = str(LOCK_FILE)
+    try:
+        if os.path.lexists(lock_str):
+            st = os.lstat(lock_str)
+            if not stat.S_ISLNK(st.st_mode) and st.st_uid == os.getuid():
+                os.unlink(lock_str)
     except Exception:
         pass
 
@@ -619,11 +664,11 @@ def action_status():
         state["running"] = True
         state["character"] = char_name or state.get("character", "DarkOmenZA")
         state["address"] = client.get("address", "")
-        ws = client.get("workspace", {}).get("name", "")
-        if "special:runescape" in ws:
+        if is_runelite_in_scratchpad(client):
             state["mode"] = "popup"
         else:
             state["mode"] = "normal"
+            state["popupOpen"] = False
     else:
         state["running"] = False
         state["popupOpen"] = False
@@ -640,9 +685,23 @@ def action_toggle():
     if not client:
         return {"ok": False, "error": "RuneLite is not running", "running": False}
 
+    in_scratchpad = is_runelite_in_scratchpad(client)
+    now = time.time()
+
+    if not in_scratchpad:
+        addr = client.get("address", "")
+        if addr:
+            run_hypr_eval(f'hl.dispatch(hl.dsp.focus({{ window = "address:{addr}" }}))')
+        state["popupOpen"] = False
+        state["mode"] = "normal"
+        state["alert"] = False
+        state["alertMessage"] = ""
+        state["lastUpdated"] = int(now * 1000)
+        safe_write_state(state)
+        return {"ok": True, "mode": "normal", "focused": True, "popupOpen": False}
+
     active_sw = get_active_special_workspace()
     is_open = (active_sw == "special:runescape")
-    now = time.time()
     last_dismiss = float(state.get("lastDismissTime", 0))
 
     if not is_open and (now - last_dismiss) < 0.4:
@@ -687,9 +746,11 @@ def action_dismiss():
     state["lastDismissTime"] = now
     state["lastUpdated"] = int(now * 1000)
     safe_write_state(state)
-    if active_sw == "special:runescape":
-        run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
-    refocus_active_workspace()
+    client = get_runelite_client()
+    if is_runelite_in_scratchpad(client):
+        if active_sw == "special:runescape":
+            run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
+        refocus_active_workspace()
     return {"ok": True, "popupOpen": False}
 
 def action_detach(ws="5"):
@@ -972,11 +1033,16 @@ def is_safe_socket(path_str):
         return False
 
 def run_daemon():
+    if not acquire_daemon_lock():
+        print("Daemon lock already held by another process; exiting.")
+        return
+
     old_pid = read_daemon_pid()
     if old_pid is not None:
         try:
             os.kill(old_pid, 0)
             print(f"Daemon already running with PID {old_pid}")
+            remove_daemon_lock()
             return
         except (ProcessLookupError, ValueError):
             remove_daemon_pid()
@@ -985,6 +1051,7 @@ def run_daemon():
         write_daemon_pid()
     except Exception as e:
         print(f"Failed to acquire daemon PID file: {e}", file=sys.stderr)
+        remove_daemon_lock()
         return
 
     xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
@@ -1034,6 +1101,12 @@ def run_daemon():
                     state["alertMessage"] = notif_msg
                     modified = True
 
+                in_scratchpad = is_runelite_in_scratchpad(client)
+                target_mode = "popup" if in_scratchpad else "normal"
+                if state.get("mode") != target_mode:
+                    state["mode"] = target_mode
+                    modified = True
+
                 if client:
                     ensure_jagex_launcher_hidden()
                     if not state.get("running"):
@@ -1053,17 +1126,23 @@ def run_daemon():
                         state["hasGainedFocus"] = False
                         modified = True
 
-                active_sw_poll = get_active_special_workspace()
-                is_sw_visible = (active_sw_poll == "special:runescape")
-                now_poll = time.time()
-                opened_at_poll = float(state.get("openedAt", 0))
-                if state.get("popupOpen") and not is_sw_visible and (now_poll - opened_at_poll) >= 1.0:
-                    state["popupOpen"] = False
-                    state["hasGainedFocus"] = False
-                    modified = True
-                elif not state.get("popupOpen") and is_sw_visible and (now_poll - opened_at_poll) >= 1.0:
-                    run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
-                    refocus_active_workspace()
+                if in_scratchpad:
+                    active_sw_poll = get_active_special_workspace()
+                    is_sw_visible = (active_sw_poll == "special:runescape")
+                    now_poll = time.time()
+                    opened_at_poll = float(state.get("openedAt", 0))
+                    if state.get("popupOpen") and not is_sw_visible and (now_poll - opened_at_poll) >= 1.0:
+                        state["popupOpen"] = False
+                        state["hasGainedFocus"] = False
+                        modified = True
+                    elif not state.get("popupOpen") and is_sw_visible and (now_poll - opened_at_poll) >= 1.0:
+                        run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
+                        refocus_active_workspace()
+                else:
+                    if state.get("popupOpen"):
+                        state["popupOpen"] = False
+                        state["hasGainedFocus"] = False
+                        modified = True
 
                 if modified:
                     safe_write_state(state)
@@ -1101,7 +1180,10 @@ def run_daemon():
                             opened_at = float(state.get("openedAt", 0))
 
                             if is_runelite:
-                                if not state.get("popupOpen") and (now - opened_at) >= 1.0:
+                                client = get_runelite_client()
+                                in_scratchpad = is_runelite_in_scratchpad(client)
+
+                                if in_scratchpad and not state.get("popupOpen") and (now - opened_at) >= 1.0:
                                     active_sw = get_active_special_workspace()
                                     if active_sw == "special:runescape":
                                         run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
@@ -1112,17 +1194,19 @@ def run_daemon():
                                         state["alert"] = False
                                         state["alertMessage"] = ""
                                         modified = True
-                                    if not state.get("hasGainedFocus"):
+                                    if in_scratchpad and not state.get("hasGainedFocus"):
                                         state["hasGainedFocus"] = True
                                         modified = True
                                     if modified:
                                         safe_write_state(state)
 
                             if state.get("popupOpen") and state.get("hasGainedFocus") and not is_runelite and active_cls != "" and (now - opened_at) >= 1.0:
-                                active_sw = get_active_special_workspace()
-                                if active_sw == "special:runescape":
-                                    run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
-                                refocus_active_workspace()
+                                client = get_runelite_client()
+                                if is_runelite_in_scratchpad(client):
+                                    active_sw = get_active_special_workspace()
+                                    if active_sw == "special:runescape":
+                                        run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
+                                    refocus_active_workspace()
                                 state["popupOpen"] = False
                                 state["hasGainedFocus"] = False
                                 state["lastDismissTime"] = now
@@ -1134,10 +1218,12 @@ def run_daemon():
                             now = time.time()
                             opened_at = float(state.get("openedAt", 0))
                             if state.get("popupOpen") and (now - opened_at) >= 0.8:
-                                active_sw = get_active_special_workspace()
-                                if active_sw == "special:runescape":
-                                    run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
-                                refocus_active_workspace()
+                                client = get_runelite_client()
+                                if is_runelite_in_scratchpad(client):
+                                    active_sw = get_active_special_workspace()
+                                    if active_sw == "special:runescape":
+                                        run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
+                                    refocus_active_workspace()
                                 state["popupOpen"] = False
                                 state["lastDismissTime"] = now
                                 state["lastUpdated"] = int(now * 1000)
@@ -1177,6 +1263,7 @@ def run_daemon():
 
     finally:
         remove_daemon_pid()
+        remove_daemon_lock()
 
 def ensure_daemon_running():
     old_pid = read_daemon_pid()
