@@ -523,6 +523,8 @@ def find_jagex_launcher():
         str(Path.home() / ".local/bin/jagex-launcher-beta-linux-x86_64.AppImage"),
         str(Path.home() / ".local/share/Jagex Launcher/jagex-launcher"),
         str(Path.home() / ".local/share/Jagex Launcher/jagex-launcher.AppImage"),
+        str(Path.home() / "Downloads/jagex-launcher-beta-linux-x86_64.AppImage"),
+        str(Path.home() / "Downloads/jagex-launcher.AppImage"),
         "/var/lib/flatpak/exports/bin/com.jagex.Launcher",
         str(Path.home() / ".local/share/flatpak/exports/bin/com.jagex.Launcher"),
     ]
@@ -908,7 +910,8 @@ def launch_binary(target_app, env):
             break
 
     cmd = [target_app]
-    if not has_fuse2 and target_app.lower().endswith(".appimage"):
+    real_target = os.path.realpath(target_app).lower()
+    if not has_fuse2 and (target_app.lower().endswith(".appimage") or real_target.endswith(".appimage")):
         cmd.append("--appimage-extract-and-run")
 
     log_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
