@@ -336,7 +336,7 @@ def ensure_runelite_geometry(w=POPUP_W, h=POPUP_H):
         return
     if not is_runelite_in_scratchpad(client):
         return
-    addr = client.get("address", "")
+    addr = str(client.get("address", "")).replace('"', '').strip()
     if not addr:
         return
 
@@ -348,9 +348,15 @@ def ensure_runelite_geometry(w=POPUP_W, h=POPUP_H):
     local target_addr = "{addr}"
     for _, win in ipairs(hl.get_windows()) do
       if win.address == target_addr then
-        hl.dispatch(hl.dsp.focus({{ window = "address:" .. target_addr }}))
+        hl.dispatch(hl.dsp.focus({{ window = win }}))
         local act = hl.get_active_window()
         if act and act.address == target_addr then
+          if act.fullscreen and act.fullscreen ~= 0 then
+            hl.dispatch(hl.dsp.window.fullscreen({{ mode = "fullscreen" }}))
+          end
+          if not act.floating then
+            hl.dispatch(hl.dsp.window.float({{ action = "toggle" }}))
+          end
           hl.dispatch(hl.dsp.window.move({{ x = {pos_x}, y = {pos_y}, relative = false }}))
           hl.dispatch(hl.dsp.window.resize({{ x = {w}, y = {h}, relative = false }}))
         end
@@ -775,7 +781,7 @@ def action_detach(ws="5"):
     client = get_runelite_client()
     if not client:
         return {"ok": False, "error": "RuneLite is not running"}
-    addr = client.get("address", "")
+    addr = str(client.get("address", "")).replace('"', '').strip()
     if not addr:
         return {"ok": False, "error": "No RuneLite address"}
 
@@ -786,6 +792,9 @@ def action_detach(ws="5"):
         hl.dispatch(hl.dsp.focus({{ window = w }}))
         local act = hl.get_active_window()
         if act and act.address == target_addr then
+          if act.floating then
+            hl.dispatch(hl.dsp.window.float({{ action = "toggle" }}))
+          end
           hl.dispatch(hl.dsp.window.move({{ workspace = "{ws}", follow = true }}))
           hl.dispatch(hl.dsp.window.center({{}}))
         end
@@ -807,7 +816,7 @@ def action_dock():
     client = get_runelite_client()
     if not client:
         return {"ok": False, "error": "RuneLite is not running"}
-    addr = client.get("address", "")
+    addr = str(client.get("address", "")).replace('"', '').strip()
     if not addr:
         return {"ok": False, "error": "No RuneLite address"}
 
@@ -822,6 +831,12 @@ def action_dock():
         hl.dispatch(hl.dsp.focus({{ window = w }}))
         local act = hl.get_active_window()
         if act and act.address == target_addr then
+          if act.fullscreen and act.fullscreen ~= 0 then
+            hl.dispatch(hl.dsp.window.fullscreen({{ mode = "fullscreen" }}))
+          end
+          if not act.floating then
+            hl.dispatch(hl.dsp.window.float({{ action = "toggle" }}))
+          end
           hl.dispatch(hl.dsp.window.move({{ workspace = "special:runescape", follow = false }}))
           hl.dispatch(hl.dsp.window.move({{ x = {pos_x}, y = {pos_y}, relative = false }}))
           hl.dispatch(hl.dsp.window.resize({{ x = {POPUP_W}, y = {POPUP_H}, relative = false }}))
@@ -831,10 +846,16 @@ def action_dock():
     end
     """
     run_hypr_eval(lua_dock)
+    active_sw = get_active_special_workspace()
+    if active_sw != "special:runescape":
+        run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
     state = safe_read_state()
     state["mode"] = "popup"
+    state["popupOpen"] = True
+    state["openedAt"] = time.time()
+    state["hasGainedFocus"] = True
     safe_write_state(state)
-    return {"ok": True, "mode": "popup"}
+    return {"ok": True, "mode": "popup", "popupOpen": True}
 
 def action_toggle_launcher():
     run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape_launcher")')
