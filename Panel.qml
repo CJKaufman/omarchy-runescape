@@ -515,7 +515,7 @@ Panel {
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
                 onClicked: {
-                  panel.open = false
+                  root.close()
                   if (root.popupOpen) {
                     root.dismissPopup()
                   } else {
@@ -559,7 +559,7 @@ Panel {
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
                 onClicked: {
-                  panel.open = false
+                  root.close()
                   root.detachWindow()
                 }
               }
@@ -600,6 +600,7 @@ Panel {
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
                 onClicked: {
+                  root.close()
                   root.dockWindow()
                 }
               }
@@ -759,6 +760,7 @@ Panel {
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
                 onClicked: {
+                  root.close()
                   root.launchJagex()
                 }
               }
@@ -799,6 +801,7 @@ Panel {
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
                 onClicked: {
+                  root.close()
                   root.launchRuneLite()
                 }
               }

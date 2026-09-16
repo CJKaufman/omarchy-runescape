@@ -173,7 +173,7 @@ def run_hypr_eval(lua_code):
     bin_path = get_hyprctl()
     if not bin_path:
         return ""
-    return run_cmd_bounded([bin_path, "eval", lua_code], timeout=3.0)
+    return run_cmd_bounded([bin_path, "repl", lua_code], timeout=3.0)
 
 def run_hypr_dispatch(lua_dsp):
     bin_path = get_hyprctl()
@@ -689,9 +689,18 @@ def action_toggle():
     now = time.time()
 
     if not in_scratchpad:
-        addr = client.get("address", "")
+        addr = str(client.get("address", "")).replace('"', '').strip()
         if addr:
-            run_hypr_eval(f'hl.dispatch(hl.dsp.focus({{ window = "address:{addr}" }}))')
+            lua = f"""
+            local target_addr = "{addr}"
+            for _, w in ipairs(hl.get_windows()) do
+              if w.address == target_addr then
+                hl.dispatch(hl.dsp.focus({{ window = w }}))
+                break
+              end
+            end
+            """
+            run_hypr_eval(lua)
         state["popupOpen"] = False
         state["mode"] = "normal"
         state["alert"] = False
@@ -726,9 +735,18 @@ def action_toggle():
         safe_write_state(state)
         run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
         ensure_runelite_geometry()
-        addr = client.get("address", "")
+        addr = str(client.get("address", "")).replace('"', '').strip()
         if addr:
-            run_hypr_eval(f'hl.dispatch(hl.dsp.focus({{ window = "address:{addr}" }}))')
+            lua = f"""
+            local target_addr = "{addr}"
+            for _, w in ipairs(hl.get_windows()) do
+              if w.address == target_addr then
+                hl.dispatch(hl.dsp.focus({{ window = w }}))
+                break
+              end
+            end
+            """
+            run_hypr_eval(lua)
     else:
         state["lastDismissTime"] = now
         safe_write_state(state)
