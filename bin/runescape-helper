@@ -536,6 +536,8 @@ def find_jagex_launcher():
         str(Path.home() / ".local/bin/jagex-launcher-beta-linux-x86_64.AppImage"),
         str(Path.home() / ".local/share/Jagex Launcher/jagex-launcher"),
         str(Path.home() / ".local/share/Jagex Launcher/jagex-launcher.AppImage"),
+        str(Path.home() / "Applications/jagex-launcher-beta-linux-x86_64_940b19df1ad579979ac7a4b382661ac5.AppImage"),
+        str(Path.home() / "Downloads/Game Downloads/jagex-launcher-beta-linux-x86_64.AppImage"),
         str(Path.home() / "Downloads/jagex-launcher-beta-linux-x86_64.AppImage"),
         str(Path.home() / "Downloads/jagex-launcher.AppImage"),
         "/var/lib/flatpak/exports/bin/com.jagex.Launcher",
@@ -966,6 +968,10 @@ def action_launch():
         state = safe_read_state()
         state["launcherRunning"] = True
         safe_write_state(state)
+        if "jagex" in Path(target_app).name.lower():
+            active_sw = get_active_special_workspace()
+            if active_sw != "special:runescape_launcher":
+                run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape_launcher")')
         return {"ok": True, "launched": target_app}
     except Exception as e:
         err = f"Failed to start {Path(target_app).name}: {e}"
@@ -1305,6 +1311,13 @@ def run_daemon():
                                     state["popupOpen"] = True
                                     state["openedAt"] = time.time()
                                     state["hasGainedFocus"] = False
+                                    safe_write_state(state)
+                                elif "jagex" in opened_cls:
+                                    active_sw = get_active_special_workspace()
+                                    if active_sw != "special:runescape_launcher":
+                                        run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape_launcher")')
+                                    state = safe_read_state()
+                                    state["launcherRunning"] = True
                                     safe_write_state(state)
 
                         elif line.startswith("urgent>>"):
