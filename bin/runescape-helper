@@ -285,19 +285,30 @@ def get_monitor_geometry():
 
 def rescue_trapped_windows():
     """
-    Safety invariant: scans special:runescape. If any non-RuneLite window
-    (such as zen browser or foot) is on special:runescape, moves it back
-    to workspace 1 immediately.
+    Safety invariant: scans special:runescape and special:runescape_launcher.
+    If any non-RuneLite window is on special:runescape, or non-Jagex window
+    is on special:runescape_launcher, moves it back to workspace 1 immediately.
     """
     lua = """
     for _, w in ipairs(hl.get_windows()) do
-      if w.workspace and w.workspace.name == "special:runescape" then
-        local cls = (w.class or ""):lower()
-        if not (cls:find("runelite") or cls:find("net-runelite")) then
-          hl.dispatch(hl.dsp.focus({ window = w }))
-          local act = hl.get_active_window()
-          if act and act.address == w.address then
-            hl.dispatch(hl.dsp.window.move({ workspace = "1", follow = false }))
+      if w.workspace then
+        if w.workspace.name == "special:runescape" then
+          local cls = (w.class or ""):lower()
+          if not (cls:find("runelite") or cls:find("net-runelite")) then
+            hl.dispatch(hl.dsp.focus({ window = w }))
+            local act = hl.get_active_window()
+            if act and act.address == w.address then
+              hl.dispatch(hl.dsp.window.move({ workspace = "1", follow = false }))
+            end
+          end
+        elseif w.workspace.name == "special:runescape_launcher" then
+          local cls = (w.class or ""):lower()
+          if not cls:find("jagex") then
+            hl.dispatch(hl.dsp.focus({ window = w }))
+            local act = hl.get_active_window()
+            if act and act.address == w.address then
+              hl.dispatch(hl.dsp.window.move({ workspace = "1", follow = false }))
+            end
           end
         end
       end
@@ -370,7 +381,9 @@ def ensure_jagex_launcher_hidden():
     """
     If RuneLite is running, ensure jagex-launcher scratchpad
     is closed/tucked away in 'special:runescape_launcher'.
+    First rescues any non-launcher windows trapped there.
     """
+    rescue_trapped_windows()
     active_sw = get_active_special_workspace()
     if active_sw == "special:runescape_launcher":
         run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape_launcher")')
@@ -1284,6 +1297,15 @@ def run_daemon():
                                 if "runelite" in opened_cls:
                                     ensure_jagex_launcher_hidden()
                                     ensure_runelite_geometry()
+                                    active_sw = get_active_special_workspace()
+                                    if active_sw != "special:runescape":
+                                        run_hypr_dispatch('hl.dsp.workspace.toggle_special("runescape")')
+                                    state = safe_read_state()
+                                    state["running"] = True
+                                    state["popupOpen"] = True
+                                    state["openedAt"] = time.time()
+                                    state["hasGainedFocus"] = False
+                                    safe_write_state(state)
 
                         elif line.startswith("urgent>>"):
                             addr = line[len("urgent>>"):].strip().lower().replace("0x", "")
