@@ -914,6 +914,9 @@ def launch_binary(target_app, env):
     if not has_fuse2 and (target_app.lower().endswith(".appimage") or real_target.endswith(".appimage")):
         cmd.append("--appimage-extract-and-run")
 
+    launch_env = dict(env) if env else os.environ.copy()
+    launch_env["APPIMAGELAUNCHER_DISABLE"] = "1"
+
     log_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     log_fd = os.open(log_str, log_flags, 0o600)
 
@@ -926,7 +929,7 @@ def launch_binary(target_app, env):
         out.flush()
         proc = subprocess.Popen(
             cmd,
-            env=env,
+            env=launch_env,
             start_new_session=True,
             stdout=out,
             stderr=subprocess.STDOUT,
@@ -938,6 +941,7 @@ def action_launch():
     env = os.environ.copy()
     env["GDK_SCALE"] = "1"
     env["_JAVA_OPTIONS"] = "-Dsun.java2d.uiScale=1.0"
+    env["APPIMAGELAUNCHER_DISABLE"] = "1"
 
     target_app = find_jagex_launcher() or find_runelite()
     if not target_app:
@@ -959,6 +963,7 @@ def action_launch_runelite_direct():
     env = os.environ.copy()
     env["GDK_SCALE"] = "1"
     env["_JAVA_OPTIONS"] = "-Dsun.java2d.uiScale=1.0"
+    env["APPIMAGELAUNCHER_DISABLE"] = "1"
 
     target_app = find_runelite()
     if not target_app:
